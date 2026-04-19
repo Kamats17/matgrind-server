@@ -239,13 +239,20 @@ export class RoomManager {
 
         // When both picks are in, broadcast to both so they resolve locally
         if (room.cardPicks.p1 && room.cardPicks.p2) {
+          // Shared RNG seed: both clients run resolveRound locally. Without
+          // a shared seed their `Math.random()` rolls diverge — power variance,
+          // boundary chance, grand-amplitude pin triggers — and the room
+          // desyncs. Seed is one 32-bit integer; clients feed it into the
+          // engine's seeded-RNG path.
+          const seed = Math.floor(Math.random() * 4294967296);
           const picks = {
             p1CardId: room.cardPicks.p1,
             p2CardId: room.cardPicks.p2,
             p1SkillResult: room.cardSkills.p1,
             p2SkillResult: room.cardSkills.p2,
+            seed,
           };
-          console.log(`[TX round_picks] room=${code} p1=${picks.p1CardId} p2=${picks.p2CardId} hostConnected=${!!room.host?.ws} guestConnected=${!!room.guest?.ws}`);
+          console.log(`[TX round_picks] room=${code} p1=${picks.p1CardId} p2=${picks.p2CardId} seed=${seed} hostConnected=${!!room.host?.ws} guestConnected=${!!room.guest?.ws}`);
           send(room.host?.ws, { type: 'round_picks', ...picks });
           send(room.guest?.ws, { type: 'round_picks', ...picks });
           this.broadcastToSpectators(room, { type: 'round_picks', ...picks });
@@ -296,7 +303,18 @@ export class RoomManager {
         send(ws, { type: 'pick_acknowledged' });
 
         if (room.pinPicks.offense && room.pinPicks.defense) {
-          const picks = { offenseCardId: room.pinPicks.offense, defenseCardId: room.pinPicks.defense };
+          // Shared RNG seed — critical for pin attempts. The engine's pin
+          // resolution rolls `rng() < chance` (binary pass/fail) and the
+          // stage-3 full-escape check. Without a shared seed one client sees
+          // "pinned, match over" while the other sees "defender survived,
+          // stage 2". Seeded RNG makes the outcome identical on both sides.
+          const seed = Math.floor(Math.random() * 4294967296);
+          const picks = {
+            offenseCardId: room.pinPicks.offense,
+            defenseCardId: room.pinPicks.defense,
+            seed,
+          };
+          console.log(`[TX pin_picks] room=${code} off=${picks.offenseCardId} def=${picks.defenseCardId} seed=${seed}`);
           send(room.host?.ws, { type: 'pin_picks', ...picks });
           send(room.guest?.ws, { type: 'pin_picks', ...picks });
           this.broadcastToSpectators(room, { type: 'pin_picks', ...picks });
