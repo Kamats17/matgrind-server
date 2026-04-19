@@ -41,6 +41,11 @@ export class RoomManager {
       guest: null,
       spectators: [],   // array of { ws, uid }
       cardPicks: { p1: null, p2: null },
+      // Per-archetype micro-mechanic skill tier per side. Currently
+      // client-trusted (matches the protocol note in networkClient.js); a
+      // future authoritative server pass should re-validate using raw input
+      // timestamps before forwarding.
+      cardSkills: { p1: null, p2: null },
       pinPicks: { offense: null, defense: null },
       lastActivity: Date.now(),
       reconnectTimers: {},
@@ -79,13 +84,22 @@ export class RoomManager {
       player: 'p2',
     });
 
-    // Both run the engine locally — server relays picks
+    // Both run the engine locally — server relays picks.
+    // CRITICAL: provide a shared initial initiative so both clients start from
+    // identical state. Without this, each client rolls its own Math.random()
+    // and diverges from round 1 onward (a move played on one client produces a
+    // different outcome on the other — the match appears "stuck" because the
+    // two players see contradictory board state).
+    const initialInitiative = Math.random() < 0.5 ? 'p1' : 'p2';
+    room.initialInitiative = initialInitiative;
+
     send(room.host.ws, {
       type: 'game_start',
       player: 'p1',
       p1Name: room.host.name,
       p2Name: room.guest.name,
       style: room.style,
+      initialInitiative,
     });
     send(room.guest.ws, {
       type: 'game_start',
@@ -93,6 +107,7 @@ export class RoomManager {
       p1Name: room.host.name,
       p2Name: room.guest.name,
       style: room.style,
+      initialInitiative,
     });
 
     // Notify spectators
@@ -102,6 +117,7 @@ export class RoomManager {
       p1Name: room.host.name,
       p2Name: room.guest.name,
       style: room.style,
+      initialInitiative,
     });
 
     return { ok: true };
@@ -188,29 +204,61 @@ export class RoomManager {
     if (!room) return;
     room.lastActivity = Date.now();
 
+    // Use the server-assigned role, NOT anything from the message
     const role = ws._role;
     if (role === 'spectator') return; // spectators can't send game messages
+    if (role !== 'p1' && role !== 'p2') return; // invalid role
     const otherWs = role === 'p1' ? room.guest?.ws : room.host?.ws;
 
     switch (msg.type) {
       case 'card_pick': {
-        if (room.cardPicks[role]) return; // already picked
+        // Validate cardId is a non-empty string (game engine validates the actual ID client-side)
+        if (!msg.cardId || typeof msg.cardId !== 'string' || msg.cardId.length > 64) {
+          console.log(`[RX card_pick REJECTED] room=${code} role=${role} invalidCardId=${JSON.stringify(msg.cardId)}`);
+          return;
+        }
+        if (room.cardPicks[role]) {
+          console.log(`[RX card_pick DUPLICATE] room=${code} role=${role} cardId=${msg.cardId} — ignoring (already has ${room.cardPicks[role]})`);
+          return; // already picked
+        }
+        console.log(`[RX card_pick] room=${code} role=${role} cardId=${msg.cardId} gate=p1:${!!room.cardPicks.p1 || role==='p1'}/p2:${!!room.cardPicks.p2 || role==='p2'}`);
         room.cardPicks[role] = msg.cardId;
+        // Online rooms never accept a client-supplied skillResult. The
+        // client skips the skill challenge entirely in network mode (see
+        // commit 1050a79), so a payload here is either stale or tampered
+        // — refuse it per the server-authoritative-multiplayer-validation
+        // skill (Level 1: Refuse).
+        if (msg.skillResult !== undefined) {
+          console.warn(
+            `[SECURITY] room=${code} role=${role} sent skillResult in online mode — ignoring`,
+          );
+        }
+        room.cardSkills[role] = null;
         send(ws, { type: 'pick_acknowledged' });
 
         // When both picks are in, broadcast to both so they resolve locally
         if (room.cardPicks.p1 && room.cardPicks.p2) {
-          const picks = { p1CardId: room.cardPicks.p1, p2CardId: room.cardPicks.p2 };
+          const picks = {
+            p1CardId: room.cardPicks.p1,
+            p2CardId: room.cardPicks.p2,
+            p1SkillResult: room.cardSkills.p1,
+            p2SkillResult: room.cardSkills.p2,
+          };
+          console.log(`[TX round_picks] room=${code} p1=${picks.p1CardId} p2=${picks.p2CardId} hostConnected=${!!room.host?.ws} guestConnected=${!!room.guest?.ws}`);
           send(room.host?.ws, { type: 'round_picks', ...picks });
           send(room.guest?.ws, { type: 'round_picks', ...picks });
           this.broadcastToSpectators(room, { type: 'round_picks', ...picks });
           room.cardPicks = { p1: null, p2: null };
+          room.cardSkills = { p1: null, p2: null };
         }
         break;
       }
 
       case 'pin_pick': {
-        const side = msg.role; // 'offense' | 'defense'
+        const side = msg.role;
+        // Validate side is a valid pin role
+        if (side !== 'offense' && side !== 'defense') return;
+        if (!msg.cardId || typeof msg.cardId !== 'string' || msg.cardId.length > 64) return;
         if (room.pinPicks[side]) return;
         room.pinPicks[side] = msg.cardId;
         send(ws, { type: 'pick_acknowledged' });
@@ -226,6 +274,9 @@ export class RoomManager {
       }
 
       case 'period_choice': {
+        // Validate choice is a valid period selection
+        const validChoices = ['top', 'bottom', 'neutral', 'defer'];
+        if (!validChoices.includes(msg.choice)) return;
         // Relay period choice to both players
         send(room.host?.ws, { type: 'period_choice_made', player: role, choice: msg.choice });
         send(room.guest?.ws, { type: 'period_choice_made', player: role, choice: msg.choice });
@@ -234,10 +285,14 @@ export class RoomManager {
       }
 
       case 'config': {
-        // Update player name/style
-        if (role === 'p1' && room.host) room.host.name = msg.name || room.host.name;
-        if (role === 'p2' && room.guest) room.guest.name = msg.name || room.guest.name;
-        if (msg.style) room.style = msg.style;
+        // Players can only update their OWN name, and style only if room is still waiting
+        const name = typeof msg.name === 'string' ? msg.name.slice(0, 30) : null;
+        if (role === 'p1' && room.host && name) room.host.name = name;
+        if (role === 'p2' && room.guest && name) room.guest.name = name;
+        if (msg.style && room.phase === 'waiting') {
+          const validStyles = ['folkstyle', 'freestyle', 'greco'];
+          if (validStyles.includes(msg.style)) room.style = msg.style;
+        }
         break;
       }
 
@@ -255,10 +310,17 @@ export class RoomManager {
     if (uid) this.matchmakingQueue = this.matchmakingQueue.filter(e => e.uid !== uid);
 
     const code = ws._roomCode;
-    if (!code || !uid) return;
+    if (!code || !uid) {
+      console.log(`[DISCONNECT] uid=${uid} — not in a room, nothing to do`);
+      return;
+    }
 
     const room = this.rooms.get(code);
-    if (!room) return;
+    if (!room) {
+      console.log(`[DISCONNECT] uid=${uid} room=${code} not found`);
+      return;
+    }
+    console.log(`[DISCONNECT] uid=${uid} role=${ws._role} room=${code} — starting 45s reconnect window`);
 
     // Spectator disconnect — just remove from list
     if (ws._role === 'spectator') {
@@ -291,10 +353,17 @@ export class RoomManager {
 
   tryReconnect(ws, uid) {
     const code = this.playerRooms.get(uid);
-    if (!code) return null;
+    if (!code) {
+      console.log(`[RECONNECT] uid=${uid} — no room mapping, cannot reconnect`);
+      return null;
+    }
 
     const room = this.rooms.get(code);
-    if (!room) return null;
+    if (!room) {
+      console.log(`[RECONNECT] uid=${uid} room=${code} destroyed, cannot reconnect`);
+      return null;
+    }
+    console.log(`[RECONNECT] uid=${uid} room=${code} succeeded`);
 
     // Clear reconnection timer
     if (room.reconnectTimers[uid]) {

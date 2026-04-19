@@ -8,6 +8,12 @@ import { initFirebase } from './auth.mjs';
 import { RoomManager } from './roomManager.mjs';
 
 const PORT = process.env.PORT || 3033;
+const MAX_MESSAGE_SIZE = 4096; // 4KB — game messages are tiny JSON
+const RATE_LIMIT_WINDOW = 1000; // 1 second
+const RATE_LIMIT_MAX = 15; // messages per window
+const MAX_CONNECTIONS_PER_IP = 5;
+
+const connectionsByIP = new Map(); // ip → count
 
 // Initialize Firebase Admin for token verification
 initFirebase();
@@ -18,11 +24,7 @@ const rooms = new RoomManager();
 const httpServer = createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      rooms: rooms.activeCount(),
-      uptime: process.uptime(),
-    }));
+    res.end(JSON.stringify({ status: 'ok' }));
     return;
   }
   res.writeHead(404);
@@ -31,10 +33,29 @@ const httpServer = createServer((req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer });
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  // Per-IP connection limiting
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
+  const currentConns = connectionsByIP.get(ip) || 0;
+  if (currentConns >= MAX_CONNECTIONS_PER_IP) {
+    ws.close(1008, 'Too many connections');
+    return;
+  }
+  connectionsByIP.set(ip, currentConns + 1);
+
   ws._authenticated = false;
   ws._uid = null;
   ws._roomCode = null;
+  ws._ip = ip;
+  ws._msgCount = 0;
+  ws._msgWindowStart = Date.now();
+  // Liveness flag for the protocol-level heartbeat. Flipped back to true
+  // whenever we receive a WebSocket PONG frame (browsers auto-reply to PINGs
+  // at the protocol layer — more reliable than app-level JSON pings, which
+  // pass through the onmessage handler and are subject to rate limiting and
+  // client-side silent-drop when the socket is briefly not OPEN).
+  ws._isAlive = true;
+  ws.on('pong', () => { ws._isAlive = true; });
 
   // Require auth within 10 seconds
   const authTimeout = setTimeout(() => {
@@ -45,6 +66,25 @@ wss.on('connection', (ws) => {
   }, 10000);
 
   ws.on('message', (raw) => {
+    // Message size limit
+    if (raw.length > MAX_MESSAGE_SIZE) {
+      ws.close(1009, 'Message too large');
+      return;
+    }
+
+    // Rate limiting
+    const now = Date.now();
+    if (now - ws._msgWindowStart > RATE_LIMIT_WINDOW) {
+      ws._msgCount = 1;
+      ws._msgWindowStart = now;
+    } else {
+      ws._msgCount++;
+      if (ws._msgCount > RATE_LIMIT_MAX) {
+        send(ws, { type: 'error', message: 'Rate limit exceeded' });
+        return;
+      }
+    }
+
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
@@ -84,14 +124,22 @@ wss.on('connection', (ws) => {
         rooms.handleGameMessage(ws, msg);
         break;
       case 'pong':
+        // App-level pong: mark alive (belt-and-suspenders next to the
+        // WebSocket protocol-level pong handler set up on connection).
+        ws._isAlive = true;
         ws._lastPong = Date.now();
         break;
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
+    console.log(`[WS CLOSE] uid=${ws._uid} role=${ws._role} room=${ws._roomCode} code=${code} reason=${reason?.toString() || 'none'}`);
     clearTimeout(authTimeout);
     rooms.handleDisconnect(ws);
+    // Decrement IP connection count
+    const count = connectionsByIP.get(ws._ip) || 1;
+    if (count <= 1) connectionsByIP.delete(ws._ip);
+    else connectionsByIP.set(ws._ip, count - 1);
   });
 
   ws.on('error', () => {
@@ -99,17 +147,31 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Heartbeat: ping every 20s, disconnect if no pong within 45s
+// Heartbeat: WebSocket protocol-level PING every 25s. If a client hasn't
+// replied with a PONG control frame by the time the next tick runs
+// (~25s later), terminate. Protocol-level pings bypass the app message
+// handler — rate limits, app-level silent drops, and React/JS tab throttling
+// can't starve the heartbeat. This prevents false-positive "opponent
+// disconnected" UIs on healthy connections.
+// Also keeps the legacy app-level {type:'ping'} send for backward compat
+// with older clients, but we no longer rely on its pong arrival for liveness.
+const HEARTBEAT_INTERVAL_MS = 25000;
 setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws._authenticated) return;
-    if (ws._lastPong && Date.now() - ws._lastPong > 45000) {
-      ws.terminate();
+    if (ws._isAlive === false) {
+      console.log(`[HEARTBEAT] terminating unresponsive ws uid=${ws._uid} role=${ws._role} room=${ws._roomCode}`);
+      try { ws.terminate(); } catch { /* ignore */ }
       return;
     }
+    ws._isAlive = false;
+    try { ws.ping(); } catch { /* best effort — socket may be closing */ }
+    // Legacy app-level ping — kept so older clients without protocol-pong
+    // support still see server liveness. Server no longer uses app-level
+    // pong for liveness detection.
     send(ws, { type: 'ping' });
   });
-}, 20000);
+}, HEARTBEAT_INTERVAL_MS);
 
 // Room cleanup: expire idle rooms every 60s, clean matchmaking queue
 setInterval(() => {
@@ -120,6 +182,14 @@ setInterval(() => {
 // ── Handlers ─────────────────────────────────────────────────────────────
 
 async function handleAuth(ws, token) {
+  // Diagnostic — Codex-suggested log to confirm clients are sending a real
+  // Firebase ID token (eyJ... ~1kB JWT) and not a stale string, an access
+  // token, or a "Bearer ..." wrapped value. First 10 chars only.
+  console.log('[Auth] received', {
+    typeofToken: typeof token,
+    length: typeof token === 'string' ? token.length : null,
+    prefix: typeof token === 'string' ? token.slice(0, 10) : null,
+  });
   const { verifyToken } = await import('./auth.mjs');
   const uid = await verifyToken(token);
   if (!uid) {
@@ -130,6 +200,7 @@ async function handleAuth(ws, token) {
   ws._authenticated = true;
   ws._uid = uid;
   ws._lastPong = Date.now();
+  ws._isAlive = true;
   send(ws, { type: 'auth_success', uid });
 
   // Check if this user was in a room and reconnect

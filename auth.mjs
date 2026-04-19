@@ -7,16 +7,27 @@ export function initFirebase() {
   if (initialized) return;
 
   const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
+  const isProduction = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT;
+
   if (serviceAccount) {
     try {
       admin.initializeApp({
         credential: admin.credential.cert(JSON.parse(serviceAccount)),
       });
+      console.log('[Auth] Firebase Admin initialized — token verification enabled');
     } catch (err) {
-      console.warn('[Auth] Firebase init failed:', err.message);
+      console.error('[Auth] Firebase init failed:', err.message);
+      if (isProduction) {
+        console.error('[Auth] FATAL: Cannot run without token verification in production');
+        process.exit(1);
+      }
       console.warn('[Auth] Running without token verification (dev mode)');
     }
   } else {
+    if (isProduction) {
+      console.error('[Auth] FATAL: FIREBASE_SERVICE_ACCOUNT is required in production');
+      process.exit(1);
+    }
     console.warn('[Auth] No FIREBASE_SERVICE_ACCOUNT — running in dev mode (all tokens accepted)');
   }
   initialized = true;
