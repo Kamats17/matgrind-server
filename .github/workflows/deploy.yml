@@ -5,6 +5,11 @@ on:
     branches: [master]
   workflow_dispatch:
 
+# Railway project: matgrind-server (prod env)
+# project  d452a906-5e45-41ea-a2cc-7bc93b2ba90b
+# env      787d893c-66f7-4bd0-8572-b42ff8d7237d  (production)
+# service  09452c2b-0e94-420d-a700-94cc26633ae2  (matgrind-server)
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -18,4 +23,4 @@ jobs:
       - name: Deploy
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: railway up --service ${{ vars.RAILWAY_SERVICE || 'faithful-connection' }} --ci
+        run: railway up --service matgrind-server --ci
