@@ -47,6 +47,7 @@ export class RoomManager {
       // timestamps before forwarding.
       cardSkills: { p1: null, p2: null },
       pinPicks: { offense: null, defense: null },
+      pinAttacker: null,
       lastActivity: Date.now(),
       reconnectTimers: {},
     };
@@ -254,12 +255,43 @@ export class RoomManager {
         break;
       }
 
+      case 'pin_attempt_start': {
+        // Client hint: one of the two clients has resolved `round_picks`
+        // locally and its engine reports the match entered phase='pin_attempt'
+        // with a known attacker. We store this so we can validate subsequent
+        // `pin_pick` messages against the correct side. If the two clients
+        // disagree (first-write-wins), the server keeps the first claim.
+        if (msg.attacker !== 'p1' && msg.attacker !== 'p2') return;
+        if (!room.pinAttacker) {
+          room.pinAttacker = msg.attacker;
+          console.log(`[PIN START] room=${code} attacker=${msg.attacker} (claimed by ${role})`);
+        }
+        break;
+      }
+
       case 'pin_pick': {
         const side = msg.role;
-        // Validate side is a valid pin role
         if (side !== 'offense' && side !== 'defense') return;
         if (!msg.cardId || typeof msg.cardId !== 'string' || msg.cardId.length > 64) return;
         if (room.pinPicks[side]) return;
+
+        // Validate the sender is actually on the claimed side. Requires
+        // `room.pinAttacker` to be set via `pin_attempt_start`. If the hint
+        // never arrived (older clients, or client crash before emit), we
+        // fall through with no validation — relay-only behavior — so we
+        // don't hard-break legacy clients.
+        if (room.pinAttacker) {
+          const attackerRole = room.pinAttacker;
+          const defenderRole = attackerRole === 'p1' ? 'p2' : 'p1';
+          const claimMatches =
+            (side === 'offense' && role === attackerRole) ||
+            (side === 'defense' && role === defenderRole);
+          if (!claimMatches) {
+            console.warn(`[SECURITY] room=${code} sender=${role} sent pin_pick role=${side} but attacker=${attackerRole} — dropping`);
+            return;
+          }
+        }
+
         room.pinPicks[side] = msg.cardId;
         send(ws, { type: 'pick_acknowledged' });
 
@@ -269,6 +301,9 @@ export class RoomManager {
           send(room.guest?.ws, { type: 'pin_picks', ...picks });
           this.broadcastToSpectators(room, { type: 'pin_picks', ...picks });
           room.pinPicks = { offense: null, defense: null };
+          // Clear the attacker latch so the next pin attempt (rare but
+          // possible within a single match) starts fresh.
+          room.pinAttacker = null;
         }
         break;
       }

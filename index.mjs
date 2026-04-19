@@ -119,6 +119,7 @@ wss.on('connection', (ws, req) => {
       case 'card_pick':
       case 'period_choice':
       case 'pin_pick':
+      case 'pin_attempt_start':
       case 'config':
       case 'rematch':
         rooms.handleGameMessage(ws, msg);
