@@ -20,11 +20,27 @@ initFirebase();
 
 const rooms = new RoomManager();
 
-// HTTP server for health checks
+// HTTP server for health checks + light read-only stats. CORS-open so the
+// matchmaking lobby (a different origin in production) can poll for queue
+// size to display "{N} wrestlers searching".
 const httpServer = createServer((req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    });
+    res.end();
+    return;
+  }
   if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ status: 'ok' }));
+    return;
+  }
+  if (req.url === '/queue-size') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ size: rooms.getQueueSize() }));
     return;
   }
   res.writeHead(404);
@@ -122,6 +138,7 @@ wss.on('connection', (ws, req) => {
       case 'pin_attempt_start':
       case 'config':
       case 'rematch':
+      case 'rematch_decline':
         rooms.handleGameMessage(ws, msg);
         break;
       case 'pong':

@@ -48,6 +48,13 @@ export class RoomManager {
       cardSkills: { p1: null, p2: null },
       pinPicks: { offense: null, defense: null },
       pinAttacker: null,
+      // Per-match reroll budget — server-authoritative. Clients show their
+      // own counter mirrored from this; any `request_reroll` while at 0 is
+      // refused with a security log (Level 1: Refuse).
+      rerollsLeft: { p1: 2, p2: 2 },
+      // Rematch handshake: both sides must vote true before the room is
+      // reset and a fresh game_start is broadcast.
+      rematchVotes: { p1: false, p2: false },
       lastActivity: Date.now(),
       reconnectTimers: {},
     };
@@ -179,9 +186,14 @@ export class RoomManager {
     send(ws, { type: 'matchmaking_cancelled' });
   }
 
+  /** Public count for the read-only /queue-size HTTP endpoint. */
+  getQueueSize() {
+    return this.matchmakingQueue.length;
+  }
+
   cleanupMatchmakingQueue() {
     const now = Date.now();
-    const TIMEOUT = 120000; // 2 minutes
+    const TIMEOUT = 600000; // 10 minutes — long enough to play a CPU match on the side while still searching
     this.matchmakingQueue = this.matchmakingQueue.filter(e => {
       if (now - e.joinedAt > TIMEOUT) {
         send(e.ws, { type: 'matchmaking_timeout', message: 'No opponent found. Try again.' });
@@ -326,6 +338,30 @@ export class RoomManager {
         break;
       }
 
+      case 'request_reroll': {
+        // Refuse if a card has already been locked this round — rerolling
+        // mid-pick would let a player back out after seeing the opponent
+        // commit (server doesn't reveal that, but the timing leak still
+        // matters in PvP).
+        if (room.cardPicks[role]) {
+          console.warn(`[SECURITY] room=${code} role=${role} request_reroll after locking pick — ignoring`);
+          break;
+        }
+        const left = (room.rerollsLeft && room.rerollsLeft[role]) || 0;
+        if (left <= 0) {
+          console.warn(`[SECURITY] room=${code} role=${role} request_reroll with 0 left — ignoring`);
+          break;
+        }
+        room.rerollsLeft[role] = left - 1;
+        const myWs = role === 'p1' ? room.host?.ws : room.guest?.ws;
+        send(myWs, { type: 'reroll_granted', rerollsLeft: room.rerollsLeft[role] });
+        if (otherWs) {
+          send(otherWs, { type: 'opponent_rerolled', role, rerollsLeft: room.rerollsLeft[role] });
+        }
+        this.broadcastToSpectators(room, { type: 'opponent_rerolled', role, rerollsLeft: room.rerollsLeft[role] });
+        break;
+      }
+
       case 'period_choice': {
         // Validate choice is a valid period selection
         const validChoices = ['top', 'bottom', 'neutral', 'defer'];
@@ -350,8 +386,60 @@ export class RoomManager {
       }
 
       case 'rematch': {
-        // Relay rematch request
-        if (otherWs) send(otherWs, { type: 'rematch_requested' });
+        // Both players must vote yes before we restart. First vote prompts
+        // the opponent; second vote resets state and rebroadcasts game_start
+        // — same room, same sockets, same role assignments.
+        if (!room.rematchVotes) room.rematchVotes = { p1: false, p2: false };
+        if (room.rematchVotes[role]) break; // already voted, ignore duplicates
+
+        room.rematchVotes[role] = true;
+        send(ws, { type: 'rematch_pending' });
+
+        const otherRole = role === 'p1' ? 'p2' : 'p1';
+        if (room.rematchVotes[otherRole]) {
+          // Both voted — restart in the same room.
+          room.cardPicks = { p1: null, p2: null };
+          room.cardSkills = { p1: null, p2: null };
+          room.pinPicks = { offense: null, defense: null };
+          room.pinAttacker = null;
+          room.rerollsLeft = { p1: 2, p2: 2 };
+          room.rematchVotes = { p1: false, p2: false };
+          room.lastActivity = Date.now();
+
+          const initialInitiative = Math.random() < 0.5 ? 'p1' : 'p2';
+          room.initialInitiative = initialInitiative;
+
+          const startMsg = (player) => ({
+            type: 'game_start',
+            player,
+            p1Name: room.host?.name || 'Player 1',
+            p2Name: room.guest?.name || 'Player 2',
+            style: room.style,
+            initialInitiative,
+            rematch: true,
+          });
+          send(room.host?.ws, startMsg('p1'));
+          send(room.guest?.ws, startMsg('p2'));
+          this.broadcastToSpectators(room, startMsg('p1'));
+          console.log(`[REMATCH START] room=${code} initiative=${initialInitiative}`);
+        } else if (otherWs) {
+          // Opponent hasn't voted yet — prompt them.
+          send(otherWs, { type: 'rematch_requested' });
+        }
+        break;
+      }
+
+      case 'rematch_decline': {
+        // Either side can cancel a pending rematch. Clear the votes and
+        // tell the requester their rematch was declined so their UI can
+        // unstick from the "Waiting for opponent…" state.
+        if (!room.rematchVotes) room.rematchVotes = { p1: false, p2: false };
+        const otherRole = role === 'p1' ? 'p2' : 'p1';
+        const wasRequestedByOther = room.rematchVotes[otherRole];
+        room.rematchVotes = { p1: false, p2: false };
+        if (wasRequestedByOther && otherWs) {
+          send(otherWs, { type: 'rematch_declined' });
+        }
         break;
       }
     }
@@ -399,6 +487,10 @@ export class RoomManager {
     if (other?.ws) {
       send(other.ws, { type: 'opponent_disconnected', timeout: RECONNECT_TIMEOUT_MS / 1000 });
     }
+
+    // Drop any pending rematch votes — a half-voted handshake from before
+    // the drop must not auto-trigger a rematch when the player reconnects.
+    if (room.rematchVotes) room.rematchVotes = { p1: false, p2: false };
 
     // Clear the WebSocket reference but keep the room alive
     if (room[slot]) room[slot].ws = null;
