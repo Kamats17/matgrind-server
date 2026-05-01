@@ -379,7 +379,8 @@ export class RoomManager {
         if (role === 'p1' && room.host && name) room.host.name = name;
         if (role === 'p2' && room.guest && name) room.guest.name = name;
         if (msg.style && room.phase === 'waiting') {
-          const validStyles = ['folkstyle', 'freestyle', 'greco'];
+          // v7: women's_freestyle added as a fourth recognized style.
+          const validStyles = ['folkstyle', 'freestyle', 'greco', 'womens_freestyle'];
           if (validStyles.includes(msg.style)) room.style = msg.style;
         }
         break;
