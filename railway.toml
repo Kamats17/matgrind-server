@@ -3,7 +3,7 @@ builder = "DOCKERFILE"
 dockerfilePath = "./Dockerfile"
 
 [deploy]
-startCommand = "node index.mjs"
+startCommand = "node server-online/index.mjs"
 healthcheckPath = "/health"
 healthcheckTimeout = 10
 restartPolicyType = "ON_FAILURE"

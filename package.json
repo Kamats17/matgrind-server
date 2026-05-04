@@ -2,9 +2,9 @@
   "name": "matgrind-server",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.mjs",
+  "main": "server-online/index.mjs",
   "scripts": {
-    "start": "node index.mjs"
+    "start": "node server-online/index.mjs"
   },
   "dependencies": {
     "ws": "^8.16.0",

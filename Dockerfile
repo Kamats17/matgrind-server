@@ -5,8 +5,9 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --production
 
-COPY . .
+COPY server-online ./server-online
+COPY src ./src
 
 EXPOSE 3033
 
-CMD ["node", "index.mjs"]
+CMD ["node", "server-online/index.mjs"]
