@@ -98,3 +98,31 @@ export function renderJson() {
   for (const [k, v] of gauges) out.gauges[k] = v;
   return out;
 }
+
+// ── In-memory event ring buffer (diagnostic) ──────────────────────────────
+// Keeps the last N protocol events so a developer can curl /debug/recent
+// and see what just happened without needing Railway log access. Strictly
+// public/protocol-shape data; never include private payloads (hands, raw
+// reaction params, auth tokens). Capacity is small enough that even at a
+// couple matches per second the buffer covers the last few minutes.
+const EVENT_BUFFER_CAPACITY = 500;
+const eventBuffer = [];
+
+/**
+ * Append an event to the diagnostic ring buffer.
+ * @param {string} kind - short tag, e.g., 'card_pick', 'challenge_start',
+ *   'client_error', 'ws_close', 'void'.
+ * @param {object} fields - small KV map; values must be primitive or string-able.
+ */
+export function logEvent(kind, fields = {}) {
+  eventBuffer.push({ ts: Date.now(), kind, ...fields });
+  if (eventBuffer.length > EVENT_BUFFER_CAPACITY) {
+    eventBuffer.splice(0, eventBuffer.length - EVENT_BUFFER_CAPACITY);
+  }
+}
+
+/** Return the last `n` events (most recent first). Default 100. */
+export function recentEvents(n = 100) {
+  const slice = eventBuffer.slice(-n);
+  return slice.reverse();
+}

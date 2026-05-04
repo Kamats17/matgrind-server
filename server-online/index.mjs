@@ -10,7 +10,7 @@ import { RoomManager } from './roomManager.mjs';
 import { PingTracker, RttEstimator } from './rttEstimator.mjs';
 import { RateLimiter } from './rateLimiter.mjs';
 import { RATE_LIMITS, TIMING } from './config.mjs';
-import { incCounter, renderPrometheus, renderJson } from './metrics.mjs';
+import { incCounter, renderPrometheus, renderJson, recentEvents, logEvent } from './metrics.mjs';
 
 const PORT = process.env.PORT || 3033;
 const MAX_MESSAGE_SIZE = 4096;
@@ -51,6 +51,15 @@ const httpServer = createServer((req, res) => {
   if (req.url === '/metrics.json') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify(renderJson()));
+    return;
+  }
+  if (req.url?.startsWith('/debug/recent')) {
+    // Diagnostic: last N protocol events. Query: /debug/recent?n=200.
+    // No private data shipped (allowlist in metrics.logEvent callers).
+    const url = new URL(req.url, 'http://localhost');
+    const n = Math.min(500, Math.max(1, Number(url.searchParams.get('n')) || 200));
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify(recentEvents(n)));
     return;
   }
   res.writeHead(404);
@@ -151,6 +160,14 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', (code, reason) => {
     console.log(`[WS CLOSE] uid=${ws._uid} role=${ws._role} room=${ws._roomCode} code=${code} reason=${reason?.toString() || 'none'}`);
+    logEvent('ws_close', {
+      uid: ws._uid?.slice(0, 8) || null,
+      role: ws._role || null,
+      room: ws._roomCode || null,
+      code,
+      reason: reason?.toString() || null,
+      authed: !!ws._authenticated,
+    });
     clearTimeout(authTimeout);
     rooms.handleDisconnect(ws);
     rateLimiter.reset(`msg:${ws._uid}`);
@@ -210,6 +227,7 @@ async function handleAuth(ws, token) {
   ws._uid = uid;
   ws._isAlive = true;
   send(ws, { type: 'auth_success', uid });
+  logEvent('auth_success', { uid: uid?.slice(0, 8) || null });
 
   // Reconnect path: if this uid is already in a room, replay state.
   const reconnected = rooms.handleReconnect(ws, uid);

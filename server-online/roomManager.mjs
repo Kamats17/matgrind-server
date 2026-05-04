@@ -38,7 +38,7 @@ import {
 import { RttEstimator } from './rttEstimator.mjs';
 import { scheduleTimer, clearScheduled, destroyRoomTimers } from './timers.mjs';
 import { TIMING, HAND_SIZE } from './config.mjs';
-import { incCounter, setGauge } from './metrics.mjs';
+import { incCounter, setGauge, logEvent } from './metrics.mjs';
 
 const ROOM_CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
@@ -56,6 +56,16 @@ function send(ws, msg) {
 
 function sendError(ws, code, message) {
   send(ws, { type: 'error', code, message });
+  // Diagnostic: per-error counter so /metrics.json shows what's failing,
+  // plus a logEvent so /debug/recent shows the offending message context.
+  incCounter('client_errors_total', { code });
+  logEvent('client_error', {
+    code,
+    message,
+    role: ws?._role || null,
+    room: ws?._roomCode || null,
+    uid: ws?._uid?.slice(0, 8) || null,
+  });
 }
 
 function rngU32() {
@@ -86,6 +96,9 @@ export class RoomManager {
     ws._role = 'p1';
     incCounter('rooms_total');
     setGauge('rooms_active', this.rooms.size);
+    logEvent('room_created', {
+      room: code, hostUid: ws._uid?.slice(0, 8), style,
+    });
     return code;
   }
 
@@ -102,6 +115,9 @@ export class RoomManager {
     ws._roomCode = code;
     ws._role = 'p2';
 
+    logEvent('room_joined', {
+      room: code, guestUid: ws._uid?.slice(0, 8),
+    });
     // Notify both players, then start the match.
     send(room.host.ws, { type: 'opponent_joined', opponent: room.guest.name, player: 'p1' });
     send(room.guest.ws, { type: 'opponent_joined', opponent: room.host.name, player: 'p2' });
@@ -389,6 +405,10 @@ export class RoomManager {
     send(ws, { type: 'pick_acknowledged', roundSeq: room.roundSeq });
 
     const mechanic = getMechanicForCard(card);
+    logEvent('card_pick', {
+      room: room.code, role, cardId: msg.cardId, mechanic,
+      roundSeq: room.roundSeq,
+    });
     if (mechanic === MECHANIC_TYPES.NONE) {
       room.skillResults[role] = getMissResult();
       this._maybeResolveRound(room);
@@ -419,12 +439,25 @@ export class RoomManager {
       const rtt = room.rttEstimators.get(uid);
       if (rtt) setChallengeRttCorrection(challenge, rtt.smoothedMs);
       room.challenges[role] = challenge;
+      logEvent('challenge_start', {
+        room: room.code, role, cardId: card.id, mechanic,
+        challengeId: challenge.id, deadline: challenge.deadline - Date.now(),
+      });
+    } else {
+      logEvent('challenge_start_null', {
+        room: room.code, role, cardId: card.id, mechanic,
+      });
     }
   }
 
   _onChallengeResolved(room, role, challenge) {
     room.skillResults[role] = challenge.result;
     room.challenges[role] = null;
+    logEvent('challenge_resolved', {
+      room: room.code, role,
+      tier: challenge.result?.tier,
+      challengeId: challenge.id,
+    });
     this._maybeResolveRound(room);
   }
 
@@ -758,6 +791,11 @@ export class RoomManager {
     room.phase = 'voided';
     destroyRoomTimers(room);
     incCounter('matches_voided_total', { reason });
+    logEvent('void', {
+      room: room.code, reason,
+      roundSeq: room.roundSeq,
+      matchPhase: room.matchState?.phase || null,
+    });
     // NOTE: we deliberately leave playerRooms entries in place. Clearing
     // them here would sever the only route by which an offline player
     // can be told their match was voided - their ws is null when the
@@ -782,6 +820,12 @@ export class RoomManager {
     if (!room) return;
 
     const role = ws._role;
+    logEvent('disconnect', {
+      room: code, role, uid: uid?.slice(0, 8),
+      phase: room.phase,
+      matchPhase: room.matchState?.phase || null,
+      roundSeq: room.roundSeq,
+    });
     if (role === 'spectator') {
       // Spectator slot stays around (uid-keyed map) so reconnect can find it.
       return;
