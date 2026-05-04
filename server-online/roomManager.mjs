@@ -547,6 +547,12 @@ export class RoomManager {
     room.pinBurned[side].add(msg.cardId);
     room.pendingPinPicks[side] = msg.cardId;
     send(ws, { type: 'pick_acknowledged', roundSeq: room.roundSeq });
+    logEvent('pin_pick', {
+      room: room.code, role, side, cardId: msg.cardId,
+      stage: room.matchState.pinAttempt?.stage,
+      roundSeq: room.roundSeq,
+      bothReady: !!(room.pendingPinPicks.offense && room.pendingPinPicks.defense),
+    });
 
     if (room.pendingPinPicks.offense && room.pendingPinPicks.defense) {
       const stage = room.matchState.pinAttempt.stage ?? 1;
@@ -562,6 +568,12 @@ export class RoomManager {
         this._engineThrow(room, err, { off, def, stage });
         return;
       }
+      logEvent('pin_resolved', {
+        room: room.code, stage, off, def,
+        nextPhase: next?.phase,
+        nextStage: next?.pinAttempt?.stage ?? null,
+        winner: next?.winner ?? null,
+      });
       room.matchState = next;
       this._postResolvePin(room);
     }
