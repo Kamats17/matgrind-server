@@ -540,11 +540,19 @@ export class RoomManager {
     if (!pool[msg.cardId]) {
       return sendError(ws, 'illegal_card', `Not a ${side} card`);
     }
-    if (room.pinBurned[side].has(msg.cardId)) {
+    // Only DEFENSE cards burn across stages - the engine
+    // (resolvePinStage2 / resolvePinStage3) tracks burnedDefCards and
+    // rejects re-use, but it intentionally does NOT track burned offense
+    // cards. The attacker can pin_lock_position at stage 1 AND stage 2.
+    // Burning offense server-side would freeze any round where the
+    // attacker happens to repeat a card (the client UI doesn't gray out
+    // burned offense cards either, so the user picks one and gets stuck
+    // when the server rejects).
+    if (side === 'defense' && room.pinBurned.defense.has(msg.cardId)) {
       return sendError(ws, 'pin_card_burned', `Card ${msg.cardId} was used in a prior stage`);
     }
 
-    room.pinBurned[side].add(msg.cardId);
+    if (side === 'defense') room.pinBurned.defense.add(msg.cardId);
     room.pendingPinPicks[side] = msg.cardId;
     send(ws, { type: 'pick_acknowledged', roundSeq: room.roundSeq });
     logEvent('pin_pick', {
