@@ -163,6 +163,11 @@ function computeDeadline(mechanic, startedAt, params) {
       return startedAt + TIMING.trace_deadline_ms;
     case MECHANIC_TYPES.BURST:
       return startedAt + params.windowMs + TIMING.burst_grace_ms;
+    case MECHANIC_TYPES.PATH:
+      // strokeTimeoutMs is the in-component idle cap; +1.5s grace covers
+      // network round-trip so the server doesn't fire timeout before the
+      // client's stroke_end can arrive.
+      return startedAt + (params.strokeTimeoutMs ?? 5000) + 1500;
     default:
       return startedAt + 5000;
   }
@@ -231,6 +236,46 @@ export function recordChallengeInput(challenge, input) {
       if (swipes.length >= challenge.params.sequence.length) {
         _finish(challenge);
       }
+      return true;
+    }
+    case MECHANIC_TYPES.PATH: {
+      // stroke_end finalizes the challenge; deadline is the fallback.
+      if (eventType === 'stroke_end') {
+        challenge.events.push({ type: 'stroke_end', receivedAt });
+        _finish(challenge);
+        return true;
+      }
+      if (eventType !== 'sample') return false;
+      const p = input?.payload;
+      if (!p) return false;
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return false;
+      const SIZE = challenge.params.sizePx ?? 320;
+      if (p.x < 0 || p.x > SIZE || p.y < 0 || p.y > SIZE) {
+        challenge.suspiciousTaps += 1;
+        return false;
+      }
+      // Cap stored SAMPLES (not total events). Max legitimate samples =
+      // sampleHzMaxClient * (strokeTimeoutMs/1000) ~= 15 * 5 = 75; cap at
+      // 200 for headroom. The sliding-window rate check inside
+      // computeChallengeTier still catches floods via path_max_samples_per_sec.
+      const MAX_SAMPLES = 200;
+      let sampleCount = 0;
+      for (const e of challenge.events) {
+        if (e.type === 'sample') sampleCount += 1;
+      }
+      if (sampleCount >= MAX_SAMPLES) {
+        challenge.suspiciousTaps += 1;
+        return false;
+      }
+      challenge.events.push({
+        type: 'sample',
+        receivedAt,
+        payload: {
+          x: p.x,
+          y: p.y,
+          t: Number.isFinite(p.t) ? p.t : null,
+        },
+      });
       return true;
     }
     case MECHANIC_TYPES.BURST: {

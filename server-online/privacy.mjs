@@ -50,6 +50,10 @@ export const PUBLIC_STATE_FIELDS = new Set([
   'turnHistory',
   'neutralStaleCount',
   'stallCount',
+  // Per-side consecutive transition counter. Drives the path-mechanic
+  // spam ladder (warn / half / penalty) - clients render the warning
+  // toast based on this counter via lastResult.pXTransitionSpam.
+  'consecutiveTransitions',
   'activityClock',
   // Pin attempt phase data
   'pinAttempt',

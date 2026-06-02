@@ -24,6 +24,7 @@ export const CONDITIONS = {
   SCRAMBLE: 'scramble',                       // Both wrestlers tangled in a scramble
   TIE_UP: 'tie_up',                           // Neutral tie-up established - unlocks chain attacks
   REAR_STANDING: 'rear_standing',             // Attacker behind opponent standing - needs mat return to finish
+  REAR_STANDING_TRAPPED: 'rear_standing_trapped', // Defender has someone behind them - must fight the rear position
   BASE_BUILT: 'base_built',                   // Bottom wrestler built a base - unlocks stand-up escape
   LEG_RIDE_ESTABLISHED: 'leg_ride_established', // Top wrestler has legs hooked inside opponent's - unlocks leg-ride chain (folkstyle)
 };
@@ -618,6 +619,94 @@ export const CARDS = {
     styles: ['folkstyle', 'freestyle', 'greco'],
   },
 
+  // ══ REAR STANDING DEFENSE (require REAR_STANDING_TRAPPED) ════════════════════
+  // Defender has someone behind them in a rear standing / rear body lock. These
+  // are the legitimate responses; the trapped defender's hand is restricted to
+  // this pool (mirror of the FHL / leg-attack trapped pools). The 3 counter/
+  // scramble cards are legal in all styles; the reversal and escape cards are
+  // folkstyle-only - international styles do not score rear standing the same
+  // way, so escape/reversal scoring frequency is not added to Greco/freestyle.
+  rear_hand_fight: {
+    id: 'rear_hand_fight',
+    name: 'Hand Fight Free',
+    category: 'neutral_counter',
+    position: POSITIONS.NEUTRAL,
+    rearDefense: true,
+    staminaCost: 6,
+    basePower: 76,
+    description: 'Peel the locked hands apart and break to a scramble',
+    counters: [],
+    strongAgainst: ['rear_lift', 'rear_mat_return'],
+    setupRequired: [CONDITIONS.REAR_STANDING_TRAPPED],
+    scoreEffect: { type: 'defense', setsCondition: CONDITIONS.SCRAMBLE },
+    flavor: 'Break the grip - nobody finishes from there.',
+    styles: ['folkstyle', 'freestyle', 'greco'],
+  },
+  rear_hip_down: {
+    id: 'rear_hip_down',
+    name: 'Sit to the Hips',
+    category: 'neutral_counter',
+    position: POSITIONS.NEUTRAL,
+    rearDefense: true,
+    staminaCost: 5,
+    basePower: 78,
+    description: 'Lower the hips and base out - deny the lift and the return',
+    counters: [],
+    strongAgainst: ['rear_lift', 'rear_trip'],
+    setupRequired: [CONDITIONS.REAR_STANDING_TRAPPED],
+    scoreEffect: { type: 'counter' },
+    flavor: 'Hips down, weight down - they cannot lift you.',
+    styles: ['folkstyle', 'freestyle', 'greco'],
+  },
+  rear_whizzer_block: {
+    id: 'rear_whizzer_block',
+    name: 'Whizzer Block',
+    category: 'neutral_counter',
+    position: POSITIONS.NEUTRAL,
+    rearDefense: true,
+    staminaCost: 7,
+    basePower: 76,
+    description: 'Overhook the lifting arm and block the mat return',
+    counters: [],
+    strongAgainst: ['rear_mat_return', 'rear_lift'],
+    setupRequired: [CONDITIONS.REAR_STANDING_TRAPPED],
+    scoreEffect: { type: 'counter' },
+    flavor: 'Trap the arm - the return goes nowhere.',
+    styles: ['folkstyle', 'freestyle', 'greco'],
+  },
+  rear_standing_switch: {
+    id: 'rear_standing_switch',
+    name: 'Standing Switch',
+    category: 'neutral_counter',
+    position: POSITIONS.NEUTRAL,
+    rearDefense: true,
+    staminaCost: 8,
+    basePower: 74,
+    description: 'Turn back through and come around behind the attacker',
+    counters: [],
+    strongAgainst: ['rear_trip', 'rear_mat_return'],
+    setupRequired: [CONDITIONS.REAR_STANDING_TRAPPED],
+    scoreEffect: { type: 'reversal' },
+    flavor: 'Switch back - now you are the one behind.',
+    styles: ['folkstyle'],
+  },
+  rear_peel_and_turn: {
+    id: 'rear_peel_and_turn',
+    name: 'Peel & Turn In',
+    category: 'neutral_counter',
+    position: POSITIONS.NEUTRAL,
+    rearDefense: true,
+    staminaCost: 6,
+    basePower: 78,
+    description: 'Peel the hands, turn in and face the opponent - escape free',
+    counters: [],
+    strongAgainst: ['rear_trip', 'rear_mat_return'],
+    setupRequired: [CONDITIONS.REAR_STANDING_TRAPPED],
+    scoreEffect: { type: 'escape' },
+    flavor: 'Peel and face them - back to even.',
+    styles: ['folkstyle'],
+  },
+
   re_shot: {
     id: 're_shot',
     name: 'Re-Shot',
@@ -935,7 +1024,8 @@ export const CARDS = {
     setupRequired: [],
     scoreEffect: { type: 'control', setsCondition: CONDITIONS.TOP_PRESSURE },
     flavor: 'Clamp the ankle, control the hips.',
-    styles: ['folkstyle', 'freestyle', 'greco'],
+    // Ankle hold = below-waist contact, illegal in Greco-Roman.
+    styles: ['folkstyle', 'freestyle'],
   },
   cross_face_pressure: {
     id: 'cross_face_pressure',
@@ -1179,6 +1269,22 @@ export const CARDS = {
     setupRequired: [CONDITIONS.TOP_PRESSURE],
     scoreEffect: { type: 'near_fall', pinChance: 0.15 },
     flavor: 'Hook the leg, squeeze for the fall.',
+    styles: ['folkstyle', 'freestyle'],
+  },
+  // Surfboard - step-over back-exposure punisher. Top-turn category, near-fall
+  // scoring with a moderate pin chance comparable to half_nelson / power_half.
+  surfboard: {
+    id: 'surfboard',
+    name: 'Surfboard',
+    category: 'top_turns',
+    position: POSITIONS.TOP,
+    staminaCost: 7,
+    basePower: 64,
+    description: 'Step over the back, pull both arms - punish exposure',
+    counters: ['granby_roll', 'sit_out'],
+    setupRequired: [CONDITIONS.TOP_PRESSURE],
+    scoreEffect: { type: 'near_fall', pinChance: 0.18 },
+    flavor: 'Paddle for the lights.',
     styles: ['folkstyle', 'freestyle'],
   },
 
@@ -1508,7 +1614,8 @@ export const CARDS = {
     setupRequired: [CONDITIONS.TIE_UP],
     scoreEffect: { type: 'takedown' },
     flavor: 'Hook the leg, take them down!',
-    styles: ['folkstyle', 'freestyle', 'greco'],
+    // Inside-leg trip = leg attack, illegal in Greco-Roman.
+    styles: ['folkstyle', 'freestyle'],
   },
   drag_by: {
     id: 'drag_by',
@@ -1537,6 +1644,39 @@ export const CARDS = {
     scoreEffect: { type: 'takedown' },
     flavor: 'Slide past and spin behind!',
     styles: ['folkstyle', 'freestyle', 'greco'],
+  },
+  // Foot Sweep - quick low-cost tie-up follow-up takedown. Sits between
+  // sweep_single (62) and slide_by (64) in power; cheapest in the tie-up chain.
+  foot_sweep: {
+    id: 'foot_sweep',
+    name: 'Foot Sweep',
+    category: 'neutral_attack',
+    position: POSITIONS.NEUTRAL,
+    staminaCost: 5,
+    basePower: 60,
+    description: 'Sweep the lead leg from the outside, drop opponent flat',
+    counters: ['sprawl'],
+    setupRequired: [CONDITIONS.TIE_UP],
+    scoreEffect: { type: 'takedown' },
+    flavor: 'Sweep the lead leg!',
+    styles: ['folkstyle', 'freestyle', 'greco'],
+  },
+  // Cow Catcher - high-power tie-up combo: trap the arm, pick the leg.
+  // Highest basePower in the tie-up chain (76); higher stamina cost reflects
+  // the multi-grip commitment.
+  cow_catcher: {
+    id: 'cow_catcher',
+    name: 'Cow Catcher',
+    category: 'neutral_attack',
+    position: POSITIONS.NEUTRAL,
+    staminaCost: 8,
+    basePower: 76,
+    description: 'Trap the arm, pick the leg in one motion',
+    counters: ['sprawl', 'whizzer'],
+    setupRequired: [CONDITIONS.TIE_UP],
+    scoreEffect: { type: 'takedown' },
+    flavor: 'Arm trapped, leg captured!',
+    styles: ['folkstyle', 'freestyle'],
   },
 
   // ══ HAND FIGHTING FOLLOW-UPS (require HAND_FIGHTING) ═══════════════════════
@@ -2027,11 +2167,14 @@ const FHL_CONTROL_EXCLUDED_IDS = new Set([
   'suplex', 'headlock_throw', 'lateral_drop', 'bear_hug_lift',
 ]);
 
-// When REAR_STANDING is active, these neutral cards don't fit - you're already behind them
+// When REAR_STANDING is active, these neutral cards don't fit - you're already behind them.
+// headlock_throw needs front head control and lateral_drop needs a front over-under tie;
+// neither works from behind. A belly-to-back suplex and rear body-lock lift do, so those stay.
 const REAR_STANDING_EXCLUDED_IDS = new Set([
   'double_leg', 'single_leg', 'high_crotch', 'sweep_single',
   'collar_tie', 'underhook_control', 'snap_down', 'snap_spin',
   'fireman_carry', 're_shot', 'stuff_head', 'down_block',
+  'headlock_throw', 'lateral_drop',
 ]);
 
 // When LEG_RIDE_ESTABLISHED is active, you have legs hooked in - only leg-chain finishers + generic control moves fit.
@@ -2052,6 +2195,7 @@ export function getAvailableCards(position, conditions = [], style = 'folkstyle'
   const isFhlControl = conditions.includes(CONDITIONS.FRONT_HEADLOCK_CONTROL);
   const isTieUp = conditions.includes(CONDITIONS.TIE_UP);
   const isRearStanding = conditions.includes(CONDITIONS.REAR_STANDING);
+  const isRearTrapped = conditions.includes(CONDITIONS.REAR_STANDING_TRAPPED);
   const isLegAttack = conditions.includes(CONDITIONS.LEG_ATTACK_SECURED);
   const isLegRide = conditions.includes(CONDITIONS.LEG_RIDE_ESTABLISHED);
 
@@ -2070,8 +2214,11 @@ export function getAvailableCards(position, conditions = [], style = 'folkstyle'
     // Style filter - only show cards that belong to this wrestling style
     if (!styleMatches(card.styles)) return false;
 
-    if (card.position !== null && card.position !== position) return false;
-
+    // Trapped-state pools are resolved BEFORE the position filter. A trapped
+    // wrestler is restricted to their dedicated defense pool regardless of the
+    // `position` field: the defense cards are position:NEUTRAL, and a stale or
+    // mismatched position must never empty the pool (which would fall back to
+    // unrelated neutral cards). Style is already applied above.
     // When trapped in a front headlock, only FHL defense cards and peek_out are available
     if (isFhlTrapped) {
       return card.fhlDefense === true || card.id === 'peek_out';
@@ -2084,11 +2231,23 @@ export function getAvailableCards(position, conditions = [], style = 'folkstyle'
       return card.legDefense === true;
     }
 
+    // When trapped in a rear standing position, only the dedicated rear-defense
+    // pool is available (rear_hand_fight, rear_hip_down, rear_whizzer_block,
+    // and folkstyle-only rear_standing_switch / rear_peel_and_turn).
+    if (isRearTrapped) {
+      return card.rearDefense === true;
+    }
+
+    if (card.position !== null && card.position !== position) return false;
+
     // Exclude FHL defense cards unless the player has FRONT_HEADLOCK_TRAPPED
     if (card.fhlDefense === true) return false;
 
     // Exclude leg defense cards unless the player has LEG_ATTACK_TRAPPED
     if (card.legDefense === true) return false;
+
+    // Exclude rear-defense cards unless the player has REAR_STANDING_TRAPPED
+    if (card.rearDefense === true) return false;
 
     // Peek out only available when trapped in FHL or in a tie-up. Leg-trapped
     // has its own dedicated 6-card pool (limp_leg, whizzer_hop, crossface_and_circle,
@@ -2109,6 +2268,9 @@ export function getAvailableCards(position, conditions = [], style = 'folkstyle'
     // When leg attack secured, exclude incompatible neutral attacks - you have a leg
     if (isLegAttack && LEG_ATTACK_EXCLUDED_IDS.has(card.id)) return false;
     if (isLegAttack && card.scoreEffect?.setsCondition === CONDITIONS.LEG_ATTACK_SECURED) return false;
+    // Can't throw for amplitude or re-tie while one of their legs is in your hands
+    if (isLegAttack && card.scoreEffect?.type === 'grand_amplitude') return false;
+    if (isLegAttack && card.scoreEffect?.setsCondition === CONDITIONS.TIE_UP) return false;
 
     // When in rear standing, exclude incompatible neutral attacks
     if (isRearStanding && REAR_STANDING_EXCLUDED_IDS.has(card.id)) return false;

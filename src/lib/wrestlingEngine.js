@@ -3,7 +3,15 @@
 // Clean state machine with validated transitions
 
 import { POSITIONS, CONDITIONS, CARDS, getAvailableCards, getScores } from './wrestlingCards.js';
-import { SKILL_TIERS } from './cardArchetypeMechanics.js';
+import {
+  SKILL_TIERS,
+  MECHANIC_TUNING,
+  getMechanicForCard,
+} from './cardArchetypeMechanics.js';
+import {
+  PARTNERSHIP_ACTIVE as ELIJAH_PARTNERSHIP_ACTIVE,
+  ELIJAH_STYLE_BONUSES,
+} from './career/elijahJoles.js';
 
 export const PERIOD_DURATION = 120; // 2 min folkstyle periods
 export const FREESTYLE_PERIOD_DURATION = 180; // 3 min freestyle/greco periods
@@ -11,6 +19,17 @@ export const FREESTYLE_PERIOD_DURATION = 180; // 3 min freestyle/greco periods
 // Helper: true for freestyle, greco, and womens_freestyle (shared international rules)
 function isInternationalStyle(style) {
   return style === 'freestyle' || style === 'greco' || style === 'womens_freestyle';
+}
+
+// Tech-fall margin (true-to-life UWW + NFHS rules):
+//   folkstyle                       -> 15
+//   freestyle / womens_freestyle    -> 10
+//   greco                           -> 8  (UWW Greco-Roman: 8-point technical superiority)
+// Centralized so every guard reads the same value.
+function techFallMargin(style) {
+  if (style === 'greco') return 8;
+  if (isInternationalStyle(style)) return 10;
+  return 15;
 }
 
 // Helper: true when the women's freestyle ruleset is in use. Same on-mat
@@ -29,19 +48,32 @@ export function createInitialMatchState(
   p1Stats = null,
   p2Stats = null,
   aiDifficulty = 'medium',
-  initialInitiative = null
+  initialInitiative = null,
+  opts = {}
 ) {
   const intl = isInternationalStyle(wrestlingStyle);
+  // opts carries optional per-side metadata. All fields are backward-compatible
+  // (existing callers omit `opts` and get the legacy defaults).
+  //   opts.p1NpcId / opts.p2NpcId      stable NPC identity for a side, e.g.
+  //                                    'special_elijah_joles' (default null).
+  //   opts.p1StaminaMultiplier /       per-side seed-stamina scalar applied
+  //   opts.p2StaminaMultiplier         by applyCareerMatchModifiers (default 1.0).
   return {
     phase: 'playing',  // 'playing' | 'pin_attempt' | 'period_break' | 'overtime' | 'finished'
     period: 1,
     clock: intl ? FREESTYLE_PERIOD_DURATION : PERIOD_DURATION,
     maxPeriods: intl ? 2 : 3,
     wrestlingStyle,
-    aiDifficulty, // 'easy' | 'medium' | 'hard'
+    aiDifficulty, // 'easy' | 'medium' | 'hard' | 'expert'
     roundNumber: 0,
-    p1: createWrestler(p1Name, 'p1', p1Stats),
-    p2: createWrestler(p2Name, 'p2', p2Stats),
+    p1: createWrestler(p1Name, 'p1', p1Stats, {
+      npcId: opts.p1NpcId || null,
+      staminaMultiplier: opts.p1StaminaMultiplier ?? 1.0,
+    }),
+    p2: createWrestler(p2Name, 'p2', p2Stats, {
+      npcId: opts.p2NpcId || null,
+      staminaMultiplier: opts.p2StaminaMultiplier ?? 1.0,
+    }),
     p1Conditions: [],
     p2Conditions: [],
     pressure: { p1OnP2: 0, p2OnP1: 0 },
@@ -64,6 +96,10 @@ export function createInitialMatchState(
     // Warnings 1 & 2 are free; at 3 the opponent gets +1 and the counter
     // resets. See checkStalling() below.
     stallCount: { p1: 0, p2: 0 },
+    // Consecutive transition cards played per side. Reset on any non-transition
+    // card. Drives the path-mechanic spam ladder (warn / half-bonus / zero +
+    // stalling call) - see resolveRound below.
+    consecutiveTransitions: { p1: 0, p2: 0 },
     activityClock: 0,     // freestyle: consecutive non-scoring rounds -triggers passivity
     // Pin attempt phase data
     pinAttempt: null, // { attacker, cardId, pinChance, offenseCards, defenseCards, stage, stage1DefCard }
@@ -76,14 +112,27 @@ export function createInitialMatchState(
   };
 }
 
-function createWrestler(name, id, stats = null) {
+// Internal helper - constructs the per-side wrestler slot of match state.
+// NOT the user-facing Create Wrestler flow (that's a separate auth-onboarding
+// component). The `id` arg is the side identifier ('p1' or 'p2') and is
+// unrelated to any persistent profile id. `opts.npcId` is the optional stable
+// identity of the NPC occupying this side (e.g. 'special_elijah_joles') so
+// achievements / dialogue / per-NPC AI behavior can survive after the side
+// id has been overwritten to 'p1'/'p2'. `opts.staminaMultiplier` is the
+// per-side Career Depth Pass scalar applied to the seed stamina pool.
+function createWrestler(name, id, stats = null, opts = {}) {
   const s = stats || { str: 60, spd: 60, tec: 60, end: 60, grt: 60 };
+  // Career Depth Pass v1: opts.staminaMultiplier scales the seed stamina
+  // pool when a career tempBuff like `stamina_restore +0.10` is in play.
+  // Default 1.0 means existing non-career callers see no behavior change.
+  const staminaMul = Number.isFinite(opts.staminaMultiplier) ? opts.staminaMultiplier : 1.0;
   return {
     id,
     name,
+    npcId: opts.npcId || null,
     score: 0,
     stats: s,
-    stamina: 200 + (s.end - 50) * 0.2, // END 50→200, END 80→206, END 100→210
+    stamina: (200 + (s.end - 50) * 0.2) * staminaMul, // END 50->200, END 80->206, END 100->210
     position: POSITIONS.NEUTRAL,
     takedownCount: 0,
     escapeCount: 0,
@@ -169,6 +218,8 @@ export function describeMatchPosition(state) {
     if (p2c.includes(CONDITIONS.FRONT_HEADLOCK_TRAPPED)) return { tag: `${p2Name} in FHL`, tone: 'urgent' };
     if (p1c.includes(CONDITIONS.REAR_STANDING)) return { tag: `${p1Name} behind`, tone: 'urgent' };
     if (p2c.includes(CONDITIONS.REAR_STANDING)) return { tag: `${p2Name} behind`, tone: 'urgent' };
+    if (p1c.includes(CONDITIONS.REAR_STANDING_TRAPPED)) return { tag: `${p1Name} defending`, tone: 'urgent' };
+    if (p2c.includes(CONDITIONS.REAR_STANDING_TRAPPED)) return { tag: `${p2Name} defending`, tone: 'urgent' };
     if (p1c.includes(CONDITIONS.SCRAMBLE) || p2c.includes(CONDITIONS.SCRAMBLE)) return { tag: 'Scramble', tone: 'urgent' };
     // Greco doesn't have collar ties (upper-body-only style); the
     // equivalent over-under battle is called pummeling.
@@ -253,6 +304,19 @@ function getSlotQuotas(position, style = 'folkstyle') {
 }
 
 /**
+ * Greco-Roman forbids leg attacks, so a Greco state must never hold
+ * LEG_ATTACK_SECURED / LEG_ATTACK_TRAPPED. Returns `conditions` with those
+ * stripped when `style` is greco; a no-op for folkstyle/freestyle. Pure -
+ * used to self-heal stale/corrupt Greco state at hand build + round resolve.
+ */
+function sanitizeStyleConditions(conditions, style) {
+  if (style !== 'greco' || !Array.isArray(conditions)) return conditions || [];
+  return conditions.filter(
+    c => c !== CONDITIONS.LEG_ATTACK_SECURED && c !== CONDITIONS.LEG_ATTACK_TRAPPED,
+  );
+}
+
+/**
  * Build a hand for `position`. When `allowedCardIds` is a Set (Phase 3
  * Deck Builder), the candidate pool is first filtered to only cards in
  * that deck. If the filtered pool can't cover a full hand (edge-case
@@ -262,6 +326,7 @@ function getSlotQuotas(position, style = 'folkstyle') {
  * for users who haven't picked an active deck.
  */
 export function buildHand(position, conditions = [], size = 6, style = 'folkstyle', allowedCardIds = null) {
+  conditions = sanitizeStyleConditions(conditions, style);
   let available = getAvailableCards(position, conditions, style);
   if (allowedCardIds instanceof Set && allowedCardIds.size > 0) {
     const filtered = available.filter(c => allowedCardIds.has(c.id));
@@ -501,44 +566,73 @@ export function checkStalling(s, player, card, opponent) {
   if (s.initiative !== opponent) return;
   if ((s.neutralStaleCount || 0) < 2) return;
 
+  applyStallingCall(s, player, opponent, 'passive_neutral_counter');
+}
+
+// Shared warning/penalty body used by both checkStalling and the
+// path-mechanic transition-spam ladder. First call = warning only;
+// count >= 2 = opponent awarded STALLING_PENALTY (= 1 in folkstyle).
+// Counter does NOT reset - persistent offences keep awarding points.
+export function applyStallingCall(s, offender, beneficiary, reason) {
   if (!s.stallCount) s.stallCount = { p1: 0, p2: 0 };
-  s.stallCount[player] = (s.stallCount[player] || 0) + 1;
-  const count = s.stallCount[player];
-  const offender = s[player]?.name || player.toUpperCase();
-  const benefactor = s[opponent]?.name || opponent.toUpperCase();
+  s.stallCount[offender] = (s.stallCount[offender] || 0) + 1;
+  const count = s.stallCount[offender];
+  const offName = s[offender]?.name || offender.toUpperCase();
+  const benName = s[beneficiary]?.name || beneficiary.toUpperCase();
 
   if (count >= 2) {
-    // Penalty awarded. STALLING_PENALTY = 1 in folkstyle. Counter does
-    // NOT reset - persistent stalling keeps awarding points each round.
     const pts = getScores(s.wrestlingStyle).STALLING_PENALTY || 1;
-    s[opponent] = { ...s[opponent], score: s[opponent].score + pts };
-    const entry = `⚠ Stalling penalty (call ${count}) - ${offender} · +${pts} ${benefactor}`;
+    s[beneficiary] = { ...s[beneficiary], score: s[beneficiary].score + pts };
+    const entry = `⚠ Stalling penalty (call ${count}, ${reason}) - ${offName} · +${pts} ${benName}`;
     s.log = [...(s.log || []), { round: s.roundNumber, entry, type: 'stalling_penalty' }];
     const prior = s.lastResult?.message ? s.lastResult.message + ' · ' : '';
     s.lastResult = {
       ...(s.lastResult || {}),
       type: 'stalling_penalty',
-      stallingOffender: player,
-      stallingBeneficiary: opponent,
+      stallingOffender: offender,
+      stallingBeneficiary: beneficiary,
       stallingCallCount: count,
-      message: prior + `Stalling! ${offender} penalised (+${pts} ${benefactor})`,
+      stallingReason: reason,
+      message: prior + `Stalling! ${offName} penalised (+${pts} ${benName})`,
     };
   } else {
-    // First call: free warning. Next stalling action awards a point.
-    const entry = `⚠ Stalling warning - ${offender} · next stall awards a point`;
+    const entry = `⚠ Stalling warning (${reason}) - ${offName} · next stall awards a point`;
     s.log = [...(s.log || []), { round: s.roundNumber, entry, type: 'stalling_warning' }];
     const prior = s.lastResult?.message ? s.lastResult.message + ' · ' : '';
     s.lastResult = {
       ...(s.lastResult || {}),
       type: s.lastResult?.type || 'stalling_warning',
-      stallingOffender: player,
+      stallingOffender: offender,
       stallingWarningCount: count,
-      message: prior + `Stalling warning: ${offender} - next stall is +1 to opponent`,
+      stallingReason: reason,
+      message: prior + `Stalling warning: ${offName} - next stall is +1 to opponent`,
     };
   }
 }
 
+// Pure: input n + tuning -> { factor, level, count }. factor is the bonus
+// multiplier applied to the player's PATH-mechanic skill bonus when they
+// played a transition card. level drives the UI toast.
+export function transitionSpamFactor(n, tuning = MECHANIC_TUNING.path) {
+  const N = Number(n) || 0;
+  if (N >= tuning.spamZeroAndStallAt) return { factor: 0,   level: 'penalty', count: N };
+  if (N >= tuning.spamHalfBonusAt)    return { factor: 0.5, level: 'half',    count: N };
+  if (N >= tuning.spamWarnAt)         return { factor: 1.0, level: 'warn',    count: N };
+  return                                     { factor: 1.0, level: null,      count: N };
+}
+
 // ─── Core Round Resolution ────────────────────────────────────────────────────
+
+/**
+ * True if `cardId` is a legal play for a wrestler at `position` holding
+ * `conditions` in `style`. Single source of truth = getAvailableCards - the
+ * same predicate hand generation uses - so every legality rule (position,
+ * style, trapped pools, excluded-id sets, setupRequired) is enforced
+ * uniformly for all cards, with no per-card special-casing.
+ */
+function isCardPlayable(cardId, position, conditions, style) {
+  return getAvailableCards(position, conditions || [], style).some(c => c.id === cardId);
+}
 
 // Per-archetype micro-mechanic skill bonuses (optional). Each side's tier
 // (PERFECT / GOOD / MISS) maps to a flat power bonus and a narrowed RNG
@@ -554,6 +648,37 @@ export function resolveRound(state, p1CardId, p2CardId, p1Skill = null, p2Skill 
   if (!p1Card || !p2Card) return state;
 
   let s = deepCopy(state);
+
+  // Style-invariant self-heal. Greco forbids leg attacks, so a Greco state must
+  // never carry LEG_ATTACK_SECURED / LEG_ATTACK_TRAPPED. Strip any stale or
+  // corrupt leg-attack condition before anything reads it - this prevents a bad
+  // Greco state soft-locking into an empty card pool + illegal_card. No-op for
+  // folkstyle/freestyle.
+  s.p1Conditions = sanitizeStyleConditions(s.p1Conditions, s.wrestlingStyle);
+  s.p2Conditions = sanitizeStyleConditions(s.p2Conditions, s.wrestlingStyle);
+
+  // Legality gate (defense-in-depth). A submitted card must be legal for its
+  // wrestler's current position / conditions / style. Real callers already
+  // gate cards (buildHand + the server's in-hand check), so this never fires
+  // in normal play - it is the last line that stops an illegal card scoring
+  // or moving position from the wrong state. Whole round is rejected as a
+  // non-event: no round consumed, no stamina, no power, no mutation. Validates
+  // against the sanitized conditions so a stale Greco leg state heals here.
+  const p1Legal = isCardPlayable(p1CardId, s.p1.position, s.p1Conditions, s.wrestlingStyle);
+  const p2Legal = isCardPlayable(p2CardId, s.p2.position, s.p2Conditions, s.wrestlingStyle);
+  if (!p1Legal || !p2Legal) {
+    const bad = [!p1Legal && p1Card.name, !p2Legal && p2Card.name].filter(Boolean).join(' & ');
+    s.lastResult = {
+      type: 'illegal_card',
+      message: `Illegal card rejected: ${bad}.`,
+      p1CardId, p2CardId,
+      p1CardName: p1Card.name,
+      p2CardName: p2Card.name,
+      illegal: { p1: !p1Legal, p2: !p2Legal },
+    };
+    return s;
+  }
+
   s.roundNumber += 1;
 
   if (!s.turnHistory) s.turnHistory = { p1: {}, p2: {} };
@@ -579,19 +704,71 @@ export function resolveRound(state, p1CardId, p2CardId, p1Skill = null, p2Skill 
   let p1Power = computePower(p1Card, s, 'p1', p2Card);
   let p2Power = computePower(p2Card, s, 'p2', p1Card);
 
-  // Apply per-archetype micro-mechanic flat bonuses. Capped via Math.max
-  // so a malformed payload can't subtract from base power.
-  p1Power += Math.max(0, Number(p1Skill?.bonus) || 0);
-  p2Power += Math.max(0, Number(p2Skill?.bonus) || 0);
+  // Track consecutive transition cards per side. Reset on any non-transition
+  // card. Counter feeds the path-mechanic spam ladder below.
+  if (!s.consecutiveTransitions) s.consecutiveTransitions = { p1: 0, p2: 0 };
+  s.consecutiveTransitions.p1 = (p1Card.category === 'transition')
+    ? (s.consecutiveTransitions.p1 || 0) + 1
+    : 0;
+  s.consecutiveTransitions.p2 = (p2Card.category === 'transition')
+    ? (s.consecutiveTransitions.p2 || 0) + 1
+    : 0;
 
-  // Cache tiers so every exit path of resolveRound can stamp them onto
-  // s.lastResult - UI surfaces them in the round-result toast (Task 12).
+  // Spam ladder: the skill-bonus factor decays warn -> half -> zero, while the
+  // folkstyle stalling call fires once the consecutive count reaches spamStallAt
+  // (= 2). applyStallingCall's 1st call warns and the 2nd+ awards, so the 2nd
+  // transition warns and the 3rd (+ every further) hands the opponent +1.
+  // Stalling call is folkstyle-only; freestyle/Greco still get the bonus
+  // reduction but no point penalty (passivity is handled separately by the
+  // par-terre countdown).
+  const transitionSpamMeta = { p1: null, p2: null };
+  const evalSpam = (side, oppSide) => {
+    const n = s.consecutiveTransitions[side];
+    const spam = transitionSpamFactor(n);
+    /** @type {{ level?: string, count: number, stall?: 'warning'|'penalty' } | null} */
+    let meta = spam.level ? { level: spam.level, count: spam.count } : null;
+    if (n >= MECHANIC_TUNING.path.spamStallAt && s.wrestlingStyle === 'folkstyle') {
+      applyStallingCall(s, side, oppSide, 'transition_spam');
+      // Surface the stalling call on the spam meta. applyStallingCall also sets
+      // s.lastResult, but the gameplay-result assignment below clobbers it - the
+      // meta is the only channel that survives (tagSkill re-stamps it on every
+      // exit path). stallCount[side] >= 2 means the opponent was just awarded +1.
+      meta = { ...(meta || { count: n }), stall: s.stallCount[side] >= 2 ? 'penalty' : 'warning' };
+    }
+    if (meta) transitionSpamMeta[side] = meta;
+    return spam.factor;
+  };
+  const p1SpamFactor = evalSpam('p1', 'p2');
+  const p2SpamFactor = evalSpam('p2', 'p1');
+
+  // Apply per-archetype micro-mechanic flat bonuses. Capped via Math.max
+  // so a malformed payload can't subtract from base power. Spam factor
+  // attenuates the path mechanic's bonus on consecutive transitions.
+  const p1BonusRaw    = Math.max(0, Number(p1Skill?.bonus) || 0);
+  const p2BonusRaw    = Math.max(0, Number(p2Skill?.bonus) || 0);
+  const p1BonusActual = p1BonusRaw * p1SpamFactor;
+  const p2BonusActual = p2BonusRaw * p2SpamFactor;
+  p1Power += p1BonusActual;
+  p2Power += p2BonusActual;
+
+  // Cache tiers + mechanic + spam meta + applied bonus so every exit path of
+  // resolveRound can stamp them onto s.lastResult. UI surfaces them in the
+  // round-result toast and uses bonusApplied to render path-mechanic numbers
+  // (so spam-reduced rounds render the actual reduced bonus, not the raw tier).
   const p1SkillTier = p1Skill?.tier || 'MISS';
   const p2SkillTier = p2Skill?.tier || 'MISS';
+  const p1Mechanic  = getMechanicForCard(p1Card);
+  const p2Mechanic  = getMechanicForCard(p2Card);
   const tagSkill = (st) => {
     if (st && st.lastResult) {
       st.lastResult.p1SkillTier = p1SkillTier;
       st.lastResult.p2SkillTier = p2SkillTier;
+      st.lastResult.p1Mechanic = p1Mechanic;
+      st.lastResult.p2Mechanic = p2Mechanic;
+      st.lastResult.p1SkillBonusApplied = p1BonusActual;
+      st.lastResult.p2SkillBonusApplied = p2BonusActual;
+      if (transitionSpamMeta.p1) st.lastResult.p1TransitionSpam = transitionSpamMeta.p1;
+      if (transitionSpamMeta.p2) st.lastResult.p2TransitionSpam = transitionSpamMeta.p2;
     }
     return st;
   };
@@ -636,6 +813,7 @@ export function resolveRound(state, p1CardId, p2CardId, p1Skill = null, p2Skill 
         CONDITIONS.FRONT_HEADLOCK_CONTROL, CONDITIONS.FRONT_HEADLOCK_TRAPPED,
         CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.LEG_ATTACK_TRAPPED,
         CONDITIONS.LEG_RIDE_ESTABLISHED,
+        CONDITIONS.REAR_STANDING, CONDITIONS.REAR_STANDING_TRAPPED,
         CONDITIONS.SCRAMBLE, CONDITIONS.TIE_UP,
       ];
       s.p1Conditions = s.p1Conditions.filter(c => !boundClearConds.includes(c));
@@ -1025,12 +1203,12 @@ export function resolvePinStage1(state, offenseCardId, defenseCardId, rng = Math
       // fixed seed and should not see the call order shift).
       const fullyEscaped1Roll = rng() < 0.30;
       // Real-wrestling rule: if the bonus alone clinches the tech fall
-      // (lead >= 15 in folkstyle, >= 10 international), the match ends
+      // (lead >= 15 folkstyle, >= 10 freestyle/women's, >= 8 Greco), match ends
       // before the defender's "escape" is awarded - the buzzer cuts it
       // off. Without this guard the engine would write the +1 escape on
       // top of the score, ending tech matches as 18-1 / 16-1 instead
       // of 18-0 / 16-0.
-      const techThreshold1 = isInternationalStyle(s.wrestlingStyle) ? 10 : 15;
+      const techThreshold1 = techFallMargin(s.wrestlingStyle);
       const techReached1 = Math.abs(s[attacker].score - s[defender].score) >= techThreshold1;
       const fullyEscaped1 = fullyEscaped1Roll && !techReached1;
       const entry = techReached1
@@ -1146,7 +1324,7 @@ export function resolvePinStage2(state, offenseCardId, defenseCardId, rng = Math
       // then suppress the escape if the bonus already clinched the tech
       // fall - the match is over before the defender's escape registers.
       const fullyEscaped2Roll = rng() < 0.30;
-      const techThreshold2 = isInternationalStyle(s.wrestlingStyle) ? 10 : 15;
+      const techThreshold2 = techFallMargin(s.wrestlingStyle);
       const techReached2 = Math.abs(s[attacker].score - s[defender].score) >= techThreshold2;
       const fullyEscaped2 = fullyEscaped2Roll && !techReached2;
       const entry = techReached2
@@ -1259,8 +1437,9 @@ export function resolvePinStage3(state, offenseCardId, defenseCardId, rng = Math
     const stage3Bonus = (scores.NEAR_FALL_4 || 4) - (scores.NEAR_FALL_2 || 2);
 
     // Apply the bonus to the attacker first so we can decide whether the
-    // tech-fall lead has been clinched. Real-wrestling rule: a 15+ lead
-    // ends the match the instant the points cross the line. The defender's
+    // tech-fall lead has been clinched. Real-wrestling rule: the tech-fall
+    // margin (15 folkstyle / 10 freestyle/women's / 8 Greco) ends the match
+    // the instant the points cross the line. The defender's
     // escape (would-be +1) doesn't register because the buzzer cut it off.
     // Without this guard a 14-0 -> +4 NF tech ended 18-1 instead of 18-0,
     // and a 12-0 -> +4 NF ended 16-1 instead of 16-0.
@@ -1268,7 +1447,7 @@ export function resolvePinStage3(state, offenseCardId, defenseCardId, rng = Math
       ...s[attacker],
       score: s[attacker].score + stage3Bonus,
     };
-    const techThreshold3 = isInternationalStyle(s.wrestlingStyle) ? 10 : 15;
+    const techThreshold3 = techFallMargin(s.wrestlingStyle);
     const techReached3 = Math.abs(s[attacker].score - s[defender].score) >= techThreshold3;
     const fullyEscaped = fullyEscapedRoll && !techReached3;
 
@@ -1537,6 +1716,8 @@ const TURN_CARD_IDS = new Set([
   'grapevine_power_half', 'cross_body_ride', 'saturday_night_ride',
   'leg_cradle', 'leg_ride_power_half', 'banana_split', 'spladle',
   'chicken_wing', 'double_arm_bar',
+  // v2 partnership expansion - back-exposure punisher
+  'surfboard',
 ]);
 
 // PIN-eligible cards -these can trigger the pin_attempt phase
@@ -1551,6 +1732,8 @@ const PIN_ELIGIBLE_CARDS = new Set([
   'grapevine_power_half', 'cross_body_ride', 'saturday_night_ride',
   'leg_cradle', 'leg_ride_power_half', 'banana_split', 'spladle',
   'chicken_wing', 'double_arm_bar',
+  // v2 partnership expansion - back-exposure punisher
+  'surfboard',
 ]);
 
 // Grand amplitude cards -always pin-eligible without pinDepth requirement
@@ -1586,6 +1769,8 @@ const SCRAMBLE_CARD_IDS = new Set([
 // Tie-up follow-up cards
 const TIE_UP_FOLLOW_IDS = new Set([
   'snap_spin', 'inside_trip', 'drag_by',
+  // v2 partnership expansion - new tie-up follow-ups (universal cards)
+  'foot_sweep', 'cow_catcher',
 ]);
 
 // Bottom escape/reversal cards
@@ -1606,7 +1791,7 @@ const BOTTOM_ACTION_IDS = new Set([
 // Chain follow-up bonus: rewards setup → action sequences
 const CHAIN_BONUS = 14;
 const CHAIN_SEQUENCES = {
-  [CONDITIONS.TIE_UP]: new Set(['snap_spin', 'inside_trip', 'drag_by', 'slide_by', 'duck_under']),
+  [CONDITIONS.TIE_UP]: new Set(['snap_spin', 'inside_trip', 'drag_by', 'slide_by', 'duck_under', 'foot_sweep', 'cow_catcher']),
   [CONDITIONS.FRONT_HEADLOCK_CONTROL]: FHL_BRANCH_IDS,
   [CONDITIONS.LEG_ATTACK_SECURED]: LEG_FINISH_IDS,
   [CONDITIONS.REAR_STANDING]: new Set(['rear_mat_return', 'rear_trip', 'rear_lift']),
@@ -2286,23 +2471,38 @@ function applyResult(state, result) {
         // Counter card (legDefense=true) cleanly transitions out of a leg-trapped state.
         if (result.setsCondition === CONDITIONS.FRONT_HEADLOCK_CONTROL) {
           // Clear attacker's setup conditions (TIE_UP was the entry, now replaced by FHL)
-          const clearSetup = [CONDITIONS.TIE_UP, CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.LEG_ATTACK_TRAPPED, CONDITIONS.SCRAMBLE];
+          const clearSetup = [CONDITIONS.TIE_UP, CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.LEG_ATTACK_TRAPPED, CONDITIONS.SCRAMBLE, CONDITIONS.REAR_STANDING, CONDITIONS.REAR_STANDING_TRAPPED];
           s[`${attacker}Conditions`] = s[`${attacker}Conditions`].filter(c => !clearSetup.includes(c));
           // Set defender as trapped, clearing any prior neutral conditions
-          const clearDef = [CONDITIONS.TIE_UP, CONDITIONS.LEG_ATTACK_TRAPPED, CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.SCRAMBLE];
+          const clearDef = [CONDITIONS.TIE_UP, CONDITIONS.LEG_ATTACK_TRAPPED, CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.SCRAMBLE, CONDITIONS.REAR_STANDING, CONDITIONS.REAR_STANDING_TRAPPED];
           s[`${defender}Conditions`] = s[`${defender}Conditions`].filter(c => !clearDef.includes(c));
           if (!s[`${defender}Conditions`].includes(CONDITIONS.FRONT_HEADLOCK_TRAPPED)) {
             s[`${defender}Conditions`] = [...s[`${defender}Conditions`], CONDITIONS.FRONT_HEADLOCK_TRAPPED];
           }
         }
-        // When attacker secures a leg attack, defender becomes LEG_ATTACK_TRAPPED
-        if (result.setsCondition === CONDITIONS.LEG_ATTACK_SECURED) {
-          const clearSetup = [CONDITIONS.TIE_UP, CONDITIONS.REAR_STANDING, CONDITIONS.SCRAMBLE];
+        // When attacker secures a leg attack, defender becomes LEG_ATTACK_TRAPPED.
+        // Guarded against Greco: Greco-Roman forbids leg attacks, so the
+        // condition must never be set in a Greco match (invariant enforcement).
+        if (result.setsCondition === CONDITIONS.LEG_ATTACK_SECURED && s.wrestlingStyle !== 'greco') {
+          const clearSetup = [CONDITIONS.TIE_UP, CONDITIONS.REAR_STANDING, CONDITIONS.REAR_STANDING_TRAPPED, CONDITIONS.SCRAMBLE];
           s[`${attacker}Conditions`] = s[`${attacker}Conditions`].filter(c => !clearSetup.includes(c));
-          const clearDef = [CONDITIONS.TIE_UP, CONDITIONS.REAR_STANDING, CONDITIONS.SCRAMBLE];
+          const clearDef = [CONDITIONS.TIE_UP, CONDITIONS.REAR_STANDING, CONDITIONS.REAR_STANDING_TRAPPED, CONDITIONS.SCRAMBLE];
           s[`${defender}Conditions`] = s[`${defender}Conditions`].filter(c => !clearDef.includes(c));
           if (!s[`${defender}Conditions`].includes(CONDITIONS.LEG_ATTACK_TRAPPED)) {
             s[`${defender}Conditions`] = [...s[`${defender}Conditions`], CONDITIONS.LEG_ATTACK_TRAPPED];
+          }
+          s.chainActive = true;
+          s.initiative = attacker;
+        }
+        // When attacker goes behind, defender becomes REAR_STANDING_TRAPPED -
+        // restricts the defender's pool to the dedicated rear-defense cards.
+        if (result.setsCondition === CONDITIONS.REAR_STANDING) {
+          const clearSetup = [CONDITIONS.TIE_UP, CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.LEG_ATTACK_TRAPPED, CONDITIONS.SCRAMBLE];
+          s[`${attacker}Conditions`] = s[`${attacker}Conditions`].filter(c => !clearSetup.includes(c));
+          const clearDef = [CONDITIONS.TIE_UP, CONDITIONS.LEG_ATTACK_TRAPPED, CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.SCRAMBLE];
+          s[`${defender}Conditions`] = s[`${defender}Conditions`].filter(c => !clearDef.includes(c));
+          if (!s[`${defender}Conditions`].includes(CONDITIONS.REAR_STANDING_TRAPPED)) {
+            s[`${defender}Conditions`] = [...s[`${defender}Conditions`], CONDITIONS.REAR_STANDING_TRAPPED];
           }
           s.chainActive = true;
           s.initiative = attacker;
@@ -2358,6 +2558,7 @@ function applyResult(state, result) {
           CONDITIONS.FRONT_HEADLOCK_CONTROL, CONDITIONS.FRONT_HEADLOCK_TRAPPED,
           CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.LEG_ATTACK_TRAPPED,
           CONDITIONS.LEG_RIDE_ESTABLISHED,
+          CONDITIONS.REAR_STANDING, CONDITIONS.REAR_STANDING_TRAPPED,
         ];
         s.p1Conditions = s.p1Conditions.filter(c => !trapConds.includes(c));
         s.p2Conditions = s.p2Conditions.filter(c => !trapConds.includes(c));
@@ -2377,17 +2578,25 @@ function applyResult(state, result) {
         // narrate this in their flavor text). Clear leg-attack conditions on
         // both sides; no-op when those conditions weren't present anyway.
         if (result.setsCondition === CONDITIONS.SCRAMBLE) {
+          // Clear the trapped-state pair on BOTH sides. The defense card's owner
+          // (attacker here) was the trapped defender; the opponent held the
+          // attacking-side condition. rear_hand_fight breaking to a scramble
+          // must drop the rear attacker's REAR_STANDING - no longer "behind".
           s[`${attacker}Conditions`] = s[`${attacker}Conditions`].filter(
-            c => c !== CONDITIONS.LEG_ATTACK_TRAPPED,
+            c => c !== CONDITIONS.LEG_ATTACK_TRAPPED && c !== CONDITIONS.REAR_STANDING_TRAPPED,
           );
           s[`${defender}Conditions`] = (s[`${defender}Conditions`] || []).filter(
-            c => c !== CONDITIONS.LEG_ATTACK_SECURED,
+            c => c !== CONDITIONS.LEG_ATTACK_SECURED && c !== CONDITIONS.REAR_STANDING,
           );
         }
       }
       break;
     }
     case 'leg_attack_secured': {
+      // Greco-Roman forbids leg attacks - the leg-attack state must never exist
+      // in Greco. No Greco card produces this result; the guard enforces the
+      // invariant against future card-data changes or corrupt paths.
+      if (s.wrestlingStyle === 'greco') break;
       // Attacker has a leg -need to finish the takedown; defender must fight free
       s.chainActive = true;
       s.initiative = attacker;
@@ -2480,10 +2689,10 @@ function applyResult(state, result) {
         }
         // When establishing a new neutral setup (TIE_UP), clear any prior conflicting conditions
         if (result.setsCondition === CONDITIONS.TIE_UP) {
-          const clearConflicts = [CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.SCRAMBLE, CONDITIONS.REAR_STANDING];
+          const clearConflicts = [CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.SCRAMBLE, CONDITIONS.REAR_STANDING, CONDITIONS.REAR_STANDING_TRAPPED];
           s[`${attacker}Conditions`] = s[`${attacker}Conditions`].filter(c => !clearConflicts.includes(c));
           s[`${defender}Conditions`] = s[`${defender}Conditions`].filter(
-            c => c !== CONDITIONS.LEG_ATTACK_TRAPPED && c !== CONDITIONS.SCRAMBLE
+            c => c !== CONDITIONS.LEG_ATTACK_TRAPPED && c !== CONDITIONS.SCRAMBLE && c !== CONDITIONS.REAR_STANDING_TRAPPED
           );
           // Both wrestlers are in the tie-up -defender also gets TIE_UP so they can peek_out
           const dConds = s[`${defender}Conditions`];
@@ -2491,13 +2700,18 @@ function applyResult(state, result) {
             s[`${defender}Conditions`] = [...dConds, CONDITIONS.TIE_UP];
           }
         }
-        // When going behind (REAR_STANDING), clear tie-up and leg attack states
+        // When going behind (REAR_STANDING), clear tie-up and leg attack states.
+        // Rear setter cards are control-typed (handled in case 'control'); this
+        // setup-case branch mirrors it so a setup-typed rear card stays correct.
         if (result.setsCondition === CONDITIONS.REAR_STANDING) {
-          const clearConflicts = [CONDITIONS.TIE_UP, CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.SCRAMBLE];
+          const clearConflicts = [CONDITIONS.TIE_UP, CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.LEG_ATTACK_TRAPPED, CONDITIONS.SCRAMBLE];
           s[`${attacker}Conditions`] = s[`${attacker}Conditions`].filter(c => !clearConflicts.includes(c));
           s[`${defender}Conditions`] = s[`${defender}Conditions`].filter(
-            c => c !== CONDITIONS.LEG_ATTACK_TRAPPED && c !== CONDITIONS.TIE_UP && c !== CONDITIONS.SCRAMBLE
+            c => c !== CONDITIONS.LEG_ATTACK_TRAPPED && c !== CONDITIONS.LEG_ATTACK_SECURED && c !== CONDITIONS.TIE_UP && c !== CONDITIONS.SCRAMBLE
           );
+          if (!s[`${defender}Conditions`].includes(CONDITIONS.REAR_STANDING_TRAPPED)) {
+            s[`${defender}Conditions`] = [...s[`${defender}Conditions`], CONDITIONS.REAR_STANDING_TRAPPED];
+          }
           s.chainActive = true;
           s.initiative = attacker;
         }
@@ -2537,8 +2751,8 @@ function checkEndConditions(state) {
     return s;
   }
 
-  // Tech fall threshold: 10 for international (freestyle/greco), 15 for folkstyle
-  const techFallThreshold = isInternationalStyle(s.wrestlingStyle) ? 10 : 15;
+  // Tech fall margin: 15 folkstyle, 10 freestyle/women's, 8 Greco (UWW current rules)
+  const techFallThreshold = techFallMargin(s.wrestlingStyle);
   const lead = s.p1.score - s.p2.score;
   if (Math.abs(lead) >= techFallThreshold) {
     s.winner = lead > 0 ? 'p1' : 'p2';
@@ -2592,8 +2806,19 @@ function checkEndConditions(state) {
         s.chainActive = false;
         s.boundary = false;
         s.turnHistory = { p1: {}, p2: {} };
-        s.p1Conditions = s.p1Conditions.filter(c => c !== CONDITIONS.RECOVERING);
-        s.p2Conditions = s.p2Conditions.filter(c => c !== CONDITIONS.RECOVERING);
+        // Drop RECOVERING and every transient hold/control state so no stale
+        // FHL / leg / rear / scramble / tie-up condition lingers through the
+        // period-break window (mirrors the boundary-reset clear).
+        const periodBreakClear = [
+          CONDITIONS.RECOVERING,
+          CONDITIONS.FRONT_HEADLOCK_CONTROL, CONDITIONS.FRONT_HEADLOCK_TRAPPED,
+          CONDITIONS.LEG_ATTACK_SECURED, CONDITIONS.LEG_ATTACK_TRAPPED,
+          CONDITIONS.LEG_RIDE_ESTABLISHED,
+          CONDITIONS.REAR_STANDING, CONDITIONS.REAR_STANDING_TRAPPED,
+          CONDITIONS.SCRAMBLE, CONDITIONS.TIE_UP,
+        ];
+        s.p1Conditions = s.p1Conditions.filter(c => !periodBreakClear.includes(c));
+        s.p2Conditions = s.p2Conditions.filter(c => !periodBreakClear.includes(c));
         // Reset pin buildup and ride streak trackers at period break -fresh start
         s.p1 = { ...s.p1, pinDepth: 0, bottomRounds: 0, controlStreak: 0, rideTimeStreak: 0 };
         s.p2 = { ...s.p2, pinDepth: 0, bottomRounds: 0, controlStreak: 0, rideTimeStreak: 0 };
@@ -2792,7 +3017,15 @@ export function getAICard(state, aiPlayer, hand) {
   const ai = state[aiPlayer];
   const opp = aiPlayer === 'p1' ? state.p2 : state.p1;
   const aiConditions = state[`${aiPlayer}Conditions`] || [];
-  const difficulty = state.aiDifficulty || 'medium';
+  // 'expert' is a stricter superset of 'hard' for AI heuristics. Treat the
+  // two as equivalent here so 85+-overall opponents (state finalists, top
+  // ranked rivals, featured opponents) get the precise-card-selection path.
+  // Stat-based and personality bonuses stacked on top of this baseline make
+  // expert opponents genuinely tougher than hard via their stats, not via a
+  // separate AI branch. Lets us add 'expert' to the difficulty enum without
+  // hunting down every `=== 'hard'` comparison below.
+  const rawDifficulty = state.aiDifficulty || 'medium';
+  const difficulty = rawDifficulty === 'expert' ? 'hard' : rawDifficulty;
 
   const valid = hand.filter(card => {
     if (card.position !== null && card.position !== ai.position) return false;
@@ -2887,6 +3120,29 @@ export function getAICard(state, aiPlayer, hand) {
         if (card.id === 'reverse_lift') score += 18 * strategyMult;
         if (card.id === 'arm_drag_to_gut_wrench') score += 14 * strategyMult;
       }
+      // ── Featured-NPC AI personality blocks ────────────────────────────────
+      // Each block reads state[aiPlayer].npcId (stable NPC identity that
+      // survives 'p1'/'p2' side overwrites in createWrestler) and applies
+      // a per-card weight bump so the NPC plays to their signature kit.
+      // See src/lib/career/elijahJoles.js for the source numbers.
+      // Gated on the partnership flag: when PARTNERSHIP_ACTIVE flips false at
+      // end-of-2026 retirement, saved careers still carrying Elijah as an
+      // opponent will revert to generic AI behavior rather than continuing his
+      // signature playstyle. Weights read from the exported ELIJAH_STYLE_BONUSES
+      // table so the elijahJoles module stays the single source of truth.
+      if (ELIJAH_PARTNERSHIP_ACTIVE
+          && ai.npcId === 'special_elijah_joles'
+          && difficulty !== 'easy') {
+        const bump = ELIJAH_STYLE_BONUSES[card.id];
+        if (typeof bump === 'number') {
+          score += bump * strategyMult;
+        }
+        // Stated weakness: deprioritize high-stamina cards.
+        const staminaPenalty = ELIJAH_STYLE_BONUSES._highStaminaPenalty || 0;
+        if (card.staminaCost >= 18) {
+          score -= staminaPenalty * strategyMult;
+        }
+      }
     }
     // Easy AI ignores chain/setup/condition bonuses entirely
     if (difficulty !== 'easy') {
@@ -2929,14 +3185,16 @@ export function getAICard(state, aiPlayer, hand) {
       }
     }
     // Stalling-avoidance bias: when this AI already has 2 stalling warnings,
-    // a 3rd hands the opponent a free point. Push offensive categories and
-    // dampen `neutral_counter` / defensive so the AI breaks the stall.
+    // a 3rd hands the opponent a free point. Push genuine offence (attacks,
+    // throws) and dampen passive cards. `transition` is dampened too: it does
+    // not advance the match, and a 3rd consecutive transition is itself a
+    // stalling call - spamming transitions deepens the stall, not breaks it.
     const stallCount = state.stallCount?.[aiPlayer] || 0;
     if (stallCount >= 2) {
       const cat = card.category;
-      if (cat === 'neutral_attack' || cat === 'transition' || cat === 'throw') {
+      if (cat === 'neutral_attack' || cat === 'throw') {
         score *= 1.5;
-      } else if (cat === 'neutral_counter' || cat === 'defensive') {
+      } else if (cat === 'neutral_counter' || cat === 'defensive' || cat === 'transition') {
         score *= 0.6;
       }
     }

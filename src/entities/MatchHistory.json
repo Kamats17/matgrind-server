@@ -1,0 +1,22 @@
+{
+  "name": "MatchHistory",
+  "type": "object",
+  "properties": {
+    "player_name": { "type": "string" },
+    "opponent_name": { "type": "string" },
+    "result": { "type": "string", "enum": ["win", "loss", "draw"], "description": "Player's result" },
+    "win_method": { "type": "string", "enum": ["pin", "tech_fall", "decision", "draw"] },
+    "player_score": { "type": "number" },
+    "opponent_score": { "type": "number" },
+    "periods": { "type": "number" },
+    "notable_events": { "type": "array", "items": { "type": "string" } },
+    "xp_earned": { "type": "number" },
+    "game_mode": { "type": "string" },
+    "wrestling_style": { "type": "string" },
+    "player_takedowns": { "type": "number" },
+    "player_escapes": { "type": "number" },
+    "achievements_earned": { "type": "string", "description": "JSON array of achievement IDs earned this match" },
+    "research_data": { "type": "string", "description": "JSON blob with detailed match telemetry for research: full match log, card usage, stamina, positions, pressure, momentum, round count, duration" }
+  },
+  "required": ["player_name", "result", "win_method"]
+}

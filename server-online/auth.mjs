@@ -33,6 +33,11 @@ export function initFirebase() {
   initialized = true;
 }
 
+/** Firestore handle, or null in dev mode (no service account configured). */
+export function getFirestore() {
+  return admin.apps.length ? admin.firestore() : null;
+}
+
 /**
  * Verify a Firebase ID token.
  * Returns the UID if valid, null if invalid.

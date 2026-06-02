@@ -1,99 +1,136 @@
 // MatGrind Online Multiplayer Server (authoritative).
 //
-// The server owns matchState. Clients send intents. RoomManager.mjs runs
-// the engine, broadcasts state_update, drives challenge timing.
+// The server owns matchState. Clients send intents. RoomManager.mjs runs the
+// engine, broadcasts state_update, drives challenge timing. The connection
+// lifecycle + commit-safe auth transaction live in ConnectionController.mjs
+// (unit-tested without importing this auto-listening entrypoint).
 
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
-import { initFirebase } from './auth.mjs';
+import { initFirebase, getFirestore, verifyToken } from './auth.mjs';
 import { RoomManager } from './roomManager.mjs';
 import { PingTracker, RttEstimator } from './rttEstimator.mjs';
 import { RateLimiter } from './rateLimiter.mjs';
-import { RATE_LIMITS, TIMING } from './config.mjs';
-import { incCounter, renderPrometheus, renderJson, recentEvents, logEvent } from './metrics.mjs';
+import { ConnectionAdmission } from './connectionAdmission.mjs';
+import { ConnectionController } from './connectionController.mjs';
+import { RATE_LIMITS, TIMING, ADMISSION } from './config.mjs';
+import { incCounter, setGauge, renderPrometheus, renderJson, recentEvents, logEvent } from './metrics.mjs';
+import { routeHttp } from './httpRoutes.mjs';
+import { buildSnapshot } from './metricsSnapshot.mjs';
+import { settleAuthoritativeMatch } from './onlineRewards.mjs';
 
 const PORT = process.env.PORT || 3033;
 const MAX_MESSAGE_SIZE = 4096;
-const MAX_CONNECTIONS_PER_IP = 5;
+// Ops endpoints (/metrics*, /debug/*) are inaccessible unless this is set.
+const METRICS_AUTH_TOKEN = process.env.METRICS_AUTH_TOKEN || '';
 
-const connectionsByIP = new Map();
 const rateLimiter = new RateLimiter();
+const admission = new ConnectionAdmission({ config: ADMISSION, incCounter });
 
 initFirebase();
-const rooms = new RoomManager();
+const rooms = new RoomManager({
+  roomLimiter: rateLimiter,
+  // Stage 4: settle the match authoritatively — one transaction creates the
+  // immutable match_results/{matchId} ledger AND updates both players'
+  // online_progress docs (idempotent by matchId). Returns the per-player
+  // receipts so the room can push each a trusted match_settled message.
+  // Isolated — a settlement failure must never affect gameplay. No-ops in dev
+  // (getFirestore() is null without a service account).
+  onMatchResult: (built) => {
+    const db = getFirestore();
+    if (!db) return { receipts: [] };
+    // Bounded retry so a transient Firestore blip doesn't permanently drop a
+    // settlement (the room marks ledgerWritten before calling us and never
+    // re-emits). The transaction is idempotent, so re-running is safe.
+    return settleAuthoritativeMatch(db, built, {
+      attempts: 3,
+      sleep: (n) => new Promise((r) => setTimeout(r, 200 * n)),
+    })
+      .then((res) => {
+        if (!res.settled) console.log('[result-ledger] idempotent skip', built.matchId);
+        return res;
+      })
+      .catch((e) => {
+        incCounter('settlement_failed_total');
+        console.warn('[result-ledger] settlement failed after retries (isolated):', e?.message);
+        return { receipts: [] };
+      });
+  },
+});
 
-// HTTP server for health + queue size + metrics endpoint.
+// Metric provenance — counters are in-memory and reset on every deploy, so
+// snapshots/series must be namespaced by release + process start time.
+const RELEASE_ID = process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RELEASE_ID || 'dev';
+const PROCESS_START_MS = Date.now();
+setGauge('process_start_time_seconds', Math.floor(PROCESS_START_MS / 1000));
+setGauge('release_info', 1, { release_id: RELEASE_ID });
+
+function send(ws, msg) {
+  // Non-throwing: a socket can race to CLOSING between the check and ws.send.
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify(msg)); } catch { /* socket race during close */ }
+  }
+}
+
+// Single connection/auth controller (Stage 2A Batch 6). RTT ping/pong stay in
+// this file (heartbeat owns the ws.ping cadence) and are injected as hooks.
+const controller = new ConnectionController({
+  rooms, admission, rateLimiter, verifyToken,
+  config: { RATE_LIMITS, TIMING },
+  metrics: { incCounter, logEvent },
+  send,
+  // Per-connection auth-deadline timers (no room to attach to). index.mjs is
+  // exempt from the room-timer lint; the controller stays bare-timer-free.
+  timers: { set: (fn, ms) => setTimeout(fn, ms), clear: (h) => clearTimeout(h) },
+  onPong: (ws, msg) => {
+    ws._isAlive = true;
+    if (Number.isInteger(msg.serverPingId)) {
+      const rttMs = ws._pingTracker.resolvePong(msg.serverPingId);
+      if (rttMs !== null) {
+        ws._rttEstimator.update(rttMs);
+        if (ws._roomCode) rooms.recordRttSample(ws._roomCode, ws._uid, rttMs);
+      }
+    }
+  },
+  firstPing: (ws) => {
+    ws._isAlive = true;
+    const id = ws._pingTracker.startPing();
+    send(ws, { type: 'ping', serverPingId: id });
+  },
+});
+
+// HTTP server. Routing + access control live in httpRoutes.mjs (tested).
+// /health + /queue-size are public; ops endpoints fail closed without a token.
 const httpServer = createServer((req, res) => {
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    });
-    res.end();
-    return;
+  const r = routeHttp(req, {
+    activeCount: () => rooms.activeCount(),
+    queueSize: () => rooms.getQueueSize(),
+    metricsToken: METRICS_AUTH_TOKEN,
+    renderPrometheus,
+    renderJson,
+    recentEvents,
+  });
+  const headers = { 'Access-Control-Allow-Origin': '*' };
+  if (r.cors) {
+    headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS';
+    headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';
   }
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify({ status: 'ok', rooms: rooms.activeCount() }));
-    return;
-  }
-  if (req.url === '/queue-size') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify({ size: rooms.getQueueSize() }));
-    return;
-  }
-  if (req.url === '/metrics') {
-    res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
-    res.end(renderPrometheus());
-    return;
-  }
-  if (req.url === '/metrics.json') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify(renderJson()));
-    return;
-  }
-  if (req.url?.startsWith('/debug/recent')) {
-    // Diagnostic: last N protocol events. Query: /debug/recent?n=200.
-    // No private data shipped (allowlist in metrics.logEvent callers).
-    const url = new URL(req.url, 'http://localhost');
-    const n = Math.min(500, Math.max(1, Number(url.searchParams.get('n')) || 200));
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    res.end(JSON.stringify(recentEvents(n)));
-    return;
-  }
-  res.writeHead(404);
-  res.end();
+  if (r.contentType) headers['Content-Type'] = r.contentType;
+  res.writeHead(r.status, headers);
+  res.end(r.body || '');
 });
 
 const wss = new WebSocketServer({ server: httpServer });
 
 wss.on('connection', (ws, req) => {
-  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
-  const currentConns = connectionsByIP.get(ip) || 0;
-  if (currentConns >= MAX_CONNECTIONS_PER_IP) {
-    incCounter('connections_rejected_total', { reason: 'ip_limit' });
-    ws.close(1008, 'Too many connections');
-    return;
-  }
-  connectionsByIP.set(ip, currentConns + 1);
-  incCounter('connections_total');
+  // Admission (IP extraction + pending/attempt caps + pending lease). Rejected
+  // sockets are already closed + counted by the controller.
+  if (!controller.onConnect(ws, req)) return;
 
-  ws._authenticated = false;
-  ws._uid = null;
-  ws._roomCode = null;
-  ws._ip = ip;
   ws._isAlive = true;
   ws._pingTracker = new PingTracker();
   ws._rttEstimator = new RttEstimator();
   ws.on('pong', () => { ws._isAlive = true; });
-
-  const authTimeout = setTimeout(() => {
-    if (!ws._authenticated) {
-      send(ws, { type: 'error', code: 'auth_timeout', message: 'Auth timeout' });
-      ws.close();
-    }
-  }, 10000);
 
   ws.on('message', (raw) => {
     if (raw.length > MAX_MESSAGE_SIZE) {
@@ -102,60 +139,7 @@ wss.on('connection', (ws, req) => {
     }
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-
-    // Auth must be first message (no rate-limit; auth is one-shot)
-    if (msg.type === 'auth') {
-      clearTimeout(authTimeout);
-      handleAuth(ws, msg.token);
-      return;
-    }
-
-    if (!ws._authenticated) {
-      send(ws, { type: 'error', code: 'not_authenticated', message: 'Not authenticated' });
-      return;
-    }
-
-    // Pong handling for RTT measurement (and liveness). Bypasses rate limit.
-    if (msg.type === 'pong') {
-      ws._isAlive = true;
-      if (Number.isInteger(msg.serverPingId)) {
-        const rttMs = ws._pingTracker.resolvePong(msg.serverPingId);
-        if (rttMs !== null) {
-          ws._rttEstimator.update(rttMs);
-          if (ws._roomCode) rooms.recordRttSample(ws._roomCode, ws._uid, rttMs);
-        }
-      }
-      return;
-    }
-
-    // Rate limiting
-    const isChallengeInput = msg.type === 'challenge_input';
-    const limitKey = isChallengeInput ? `cha:${ws._uid}` : `msg:${ws._uid}`;
-    const refill = isChallengeInput ? RATE_LIMITS.challenge_inputs_per_sec : RATE_LIMITS.msgs_per_sec;
-    const burst  = isChallengeInput ? RATE_LIMITS.challenge_inputs_burst   : RATE_LIMITS.msgs_burst;
-    if (!rateLimiter.consume(limitKey, refill, burst)) {
-      send(ws, { type: 'error', code: 'rate_limited', message: 'Rate limit exceeded' });
-      return;
-    }
-
-    switch (msg.type) {
-      case 'create_room':       return handleCreateRoom(ws, msg);
-      case 'join_room':         return handleJoinRoom(ws, msg);
-      case 'spectate_room':     return handleSpectateRoom(ws, msg);
-      case 'find_match':        return rooms.findMatch(ws, msg.name, msg.style);
-      case 'cancel_matchmaking': return rooms.cancelMatchmaking(ws);
-      case 'card_pick':
-      case 'pin_pick':
-      case 'period_choice':
-      case 'request_reroll':
-      case 'challenge_input':
-      case 'rematch':
-      case 'rematch_decline':
-      case 'config':
-        return rooms.handleGameMessage(ws, msg);
-      default:
-        send(ws, { type: 'error', code: 'unknown_message_type', message: `Unknown type: ${msg.type}` });
-    }
+    controller.onMessage(ws, msg);
   });
 
   ws.on('close', (code, reason) => {
@@ -168,21 +152,14 @@ wss.on('connection', (ws, req) => {
       reason: reason?.toString() || null,
       authed: !!ws._authenticated,
     });
-    clearTimeout(authTimeout);
-    rooms.handleDisconnect(ws);
-    rateLimiter.reset(`msg:${ws._uid}`);
-    rateLimiter.reset(`cha:${ws._uid}`);
-    const count = connectionsByIP.get(ws._ip) || 1;
-    if (count <= 1) connectionsByIP.delete(ws._ip);
-    else connectionsByIP.set(ws._ip, count - 1);
+    controller.onClose(ws);
   });
 
-  ws.on('error', () => { clearTimeout(authTimeout); });
+  ws.on('error', () => { controller._clearAuthTimer(ws); });
 });
 
-// Heartbeat + RTT ping. Every 25s: protocol-level WS ping for raw
-// liveness, plus an app-level ping carrying a serverPingId so we can
-// measure RTT on pong.
+// Heartbeat + RTT ping. Every 25s: protocol-level WS ping for raw liveness,
+// plus an app-level ping carrying a serverPingId so we can measure RTT on pong.
 const HEARTBEAT_INTERVAL_MS = 25000;
 setInterval(() => {
   wss.clients.forEach(ws => {
@@ -194,75 +171,37 @@ setInterval(() => {
     }
     ws._isAlive = false;
     try { ws.ping(); } catch { /* socket may be closing */ }
-    // App-level RTT ping
     const id = ws._pingTracker.startPing();
     send(ws, { type: 'ping', serverPingId: id });
   });
 }, HEARTBEAT_INTERVAL_MS);
 
-// Idle room sweep
+// Idle room sweep + rate-bucket/attempt/room-budget eviction (2A.8), on the
+// configured cadence (MM_RATE_BUCKET_SWEEP_MS).
 setInterval(() => {
   rooms.cleanupIdleRooms();
   rooms.cleanupMatchmakingQueue();
-}, 60000);
+  controller.sweep();
+}, TIMING.rate_bucket_sweep_ms);
 
-// ── Handlers ─────────────────────────────────────────────────────────────
-
-async function handleAuth(ws, token) {
-  console.log('[Auth] received', {
-    typeofToken: typeof token,
-    length: typeof token === 'string' ? token.length : null,
-    prefix: typeof token === 'string' ? token.slice(0, 10) : null,
-  });
-  const { verifyToken } = await import('./auth.mjs');
-  const uid = await verifyToken(token);
-  if (!uid) {
-    incCounter('auth_failures_total');
-    send(ws, { type: 'auth_error', message: 'Invalid token' });
-    ws.close();
-    return;
+// Durable metrics snapshot → Firestore every 5 minutes. Isolated: a write
+// failure must never affect gameplay. No-ops in dev (no Firestore handle).
+const METRICS_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
+setInterval(async () => {
+  const db = getFirestore();
+  if (!db) return;
+  try {
+    const snap = buildSnapshot({
+      json: renderJson(),
+      releaseId: RELEASE_ID,
+      processStartTimeMs: PROCESS_START_MS,
+      nowMs: Date.now(),
+    });
+    await db.collection(snap.collection).doc(snap.docId).set(snap.data);
+  } catch (e) {
+    console.warn('[metrics-snapshot] write failed (isolated):', e?.message);
   }
-  incCounter('auth_success_total');
-  ws._authenticated = true;
-  ws._uid = uid;
-  ws._isAlive = true;
-  send(ws, { type: 'auth_success', uid });
-  logEvent('auth_success', { uid: uid?.slice(0, 8) || null });
-
-  // Reconnect path: if this uid is already in a room, replay state.
-  const reconnected = rooms.handleReconnect(ws, uid);
-  if (reconnected) {
-    rooms.attachRttEstimator(ws._roomCode, uid);
-  }
-
-  // Fire first ping immediately so RTT is measured before any challenge.
-  const id = ws._pingTracker.startPing();
-  send(ws, { type: 'ping', serverPingId: id });
-}
-
-function handleCreateRoom(ws, msg) {
-  const code = rooms.createRoom(ws, msg.name, msg.style);
-  rooms.attachRttEstimator(code, ws._uid);
-  send(ws, { type: 'room_created', code });
-}
-
-function handleJoinRoom(ws, msg) {
-  const result = rooms.joinRoom(ws, msg.code, msg.name);
-  if (result.error) {
-    send(ws, { type: 'error', code: 'join_failed', message: result.error });
-    return;
-  }
-  rooms.attachRttEstimator(ws._roomCode, ws._uid);
-}
-
-function handleSpectateRoom(ws, msg) {
-  const result = rooms.spectateRoom(ws, msg.code);
-  if (result.error) send(ws, { type: 'error', code: 'spectate_failed', message: result.error });
-}
-
-function send(ws, msg) {
-  if (ws.readyState === 1) ws.send(JSON.stringify(msg));
-}
+}, METRICS_SNAPSHOT_INTERVAL_MS);
 
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`[MatGrind Server] Listening on port ${PORT}`);

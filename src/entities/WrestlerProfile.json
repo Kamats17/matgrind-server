@@ -1,0 +1,23 @@
+{
+  "name": "WrestlerProfile",
+  "type": "object",
+  "properties": {
+    "username": { "type": "string", "description": "Display name" },
+    "wins": { "type": "number", "default": 0 },
+    "losses": { "type": "number", "default": 0 },
+    "draws": { "type": "number", "default": 0 },
+    "pins": { "type": "number", "default": 0 },
+    "tech_falls": { "type": "number", "default": 0 },
+    "total_points": { "type": "number", "default": 0 },
+    "xp": { "type": "number", "default": 0 },
+    "level": { "type": "number", "default": 1 },
+    "favorite_moves": { "type": "object", "description": "Map of cardId to use count" },
+    "goals_json": { "type": "string", "description": "Serialized goal state JSON" },
+    "achievements_json": { "type": "string", "description": "Serialized achievement ID array JSON" },
+    "streak_current": { "type": "number", "default": 0 },
+    "streak_best": { "type": "number", "default": 0 },
+    "total_matches": { "type": "number", "default": 0 },
+    "last_played_date": { "type": "string", "description": "ISO date of last match" }
+  },
+  "required": ["username"]
+}

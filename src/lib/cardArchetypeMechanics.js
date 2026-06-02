@@ -3,11 +3,17 @@
 // Used by CardSkillChallenge to render the right post-selection minigame
 // and by resolveRound() to apply skill bonuses.
 
+import { scoreTrace, getReferencePolyline } from './pathPatterns.js';
+
+// TRACE  = 2-arrow directional swipe sequence (top_turns cards).
+// PATH   = polyline-follow gesture (transition cards). DIFFERENT mechanic
+//          from TRACE despite both being called "trace" colloquially.
 export const MECHANIC_TYPES = {
   CHARGE:   'charge',
   REACTION: 'reaction',
   TRACE:    'trace',
   BURST:    'burst',
+  PATH:     'path',
   NONE:     'none',
 };
 
@@ -40,6 +46,17 @@ export const MECHANIC_TUNING = {
     windowMs: 2000,         // ~18 taps max at fast pace (~9 taps/sec)
     perfectTaps: 10,        // 10+ taps = perfect
     goodTaps:    6,         // 6-9 = good
+  },
+  path: {
+    perfectDevPx:        18,    // average per-sample deviation cap for PERFECT
+    goodDevPx:           42,    // average deviation cap for GOOD (else MISS)
+    strokeTimeoutMs:     5000,  // idle/no-stroke-end timeout
+    sampleHzMaxClient:   15,    // client-side sample throttle target
+    spamStallAt:         2,     // folkstyle: 2nd consecutive transition = stalling
+                                // warning, 3rd (+ every further) = +1 to opponent
+    spamWarnAt:          3,     // 3 consecutive transitions: warning toast
+    spamHalfBonusAt:     4,     // 4 consecutive: skill bonus halved
+    spamZeroAndStallAt:  5,     // 5 consecutive: skill bonus zeroed (stalling via spamStallAt)
   },
 };
 
@@ -80,9 +97,9 @@ const CATEGORY_TO_MECHANIC = {
   throw:           MECHANIC_TYPES.CHARGE,
   par_terre_top:   MECHANIC_TYPES.CHARGE,
   neutral_counter: MECHANIC_TYPES.REACTION,
-  top_turns:       MECHANIC_TYPES.TRACE,
+  top_turns:       MECHANIC_TYPES.TRACE,    // 2-arrow swipe
   bottom:          MECHANIC_TYPES.BURST,
-  transition:      MECHANIC_TYPES.NONE,
+  transition:      MECHANIC_TYPES.PATH,     // polyline trace (different from TRACE)
 };
 
 export function getMechanicForCard(card) {
@@ -112,11 +129,13 @@ export function getMissResult() {
 // server runs computeChallengeTier it passes `rttCorrectionMs` from its
 // per-connection RTT estimator. Offline callers pass 0.
 export const HUMAN_LIMITS = {
-  press_min_offset_ms:    50,    // any event before this offset = pre-arrival cheat
-  charge_min_held_ms:     100,   // < 100ms hold = bot
-  trace_min_swipe_gap_ms: 80,    // < 80ms between swipes = bot
-  burst_max_taps_per_sec: 25,    // > 25 taps/s = autoclicker
-  reaction_min_ms:        150,   // sub-150ms reaction = bot or pre-tap
+  press_min_offset_ms:      50,    // any event before this offset = pre-arrival cheat
+  charge_min_held_ms:       100,   // < 100ms hold = bot
+  trace_min_swipe_gap_ms:   80,    // < 80ms between swipes = bot
+  burst_max_taps_per_sec:   25,    // > 25 taps/s = autoclicker
+  reaction_min_ms:          150,   // sub-150ms reaction = bot or pre-tap
+  path_min_samples:         8,     // fewer samples than this = tap, not trace
+  path_max_samples_per_sec: 25,    // matches global RATE_LIMITS.challenge_inputs_per_sec
 };
 
 const TIER_RESULT = {
@@ -189,6 +208,17 @@ export function generateChallengeParams(mechanic, rng = Math.random) {
         perfectTaps: rngInt(rng, 8, 12),
         goodTaps:    rngInt(rng, 5, 7),
         windowMs:    rngInt(rng, 1800, 2200),
+      };
+    }
+    case MECHANIC_TYPES.PATH: {
+      return {
+        patternIndex:    rngInt(rng, 0, 5),
+        rotationDeg:     rngInt(rng, 0, 3) * 90,
+        sizePx:          320,
+        insetPx:         36,
+        perfectDevPx:    MECHANIC_TUNING.path.perfectDevPx,
+        goodDevPx:       MECHANIC_TUNING.path.goodDevPx,
+        strokeTimeoutMs: MECHANIC_TUNING.path.strokeTimeoutMs,
       };
     }
     case MECHANIC_TYPES.NONE:
@@ -307,6 +337,56 @@ export function computeChallengeTier(mechanic, params, ctx) {
       if (tapsInWindow >= params.perfectTaps) return TIER_RESULT.PERFECT;
       if (tapsInWindow >= params.goodTaps) return TIER_RESULT.GOOD;
       return TIER_RESULT.MISS;
+    }
+    case MECHANIC_TYPES.PATH: {
+      // 1) Require an explicit stroke_end. Timeout path => no stroke_end => MISS.
+      if (!events.some(e => e.type === 'stroke_end')) return TIER_RESULT.MISS;
+
+      // 2) Filter + validate sample events. Drop invalid silently.
+      const samples = [];
+      for (const e of events) {
+        if (e.type !== 'sample') continue;
+        const p = e.payload;
+        if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+        samples.push({ x: p.x, y: p.y, t: Number.isFinite(p.t) ? p.t : null });
+      }
+
+      // 3) Floor on sample count.
+      if (samples.length < HUMAN_LIMITS.path_min_samples) return TIER_RESULT.MISS;
+
+      // 4) Sliding 1s window: > path_max_samples_per_sec = bot.
+      // receivedAt-bearing events live in `events`; samples we extracted lose
+      // it. Re-derive against the filtered sequence so the rate check sees the
+      // actual server-receive cadence.
+      const sampleArrivals = events
+        .filter(e => e.type === 'sample' && e.payload && Number.isFinite(e.payload.x) && Number.isFinite(e.payload.y))
+        .map(e => e.receivedAt)
+        .sort((a, b) => a - b);
+      for (let i = 0; i < sampleArrivals.length; i++) {
+        let count = 0;
+        for (let j = i; j < sampleArrivals.length; j++) {
+          if (sampleArrivals[j] - sampleArrivals[i] <= 1000) count++;
+          else break;
+        }
+        if (count > HUMAN_LIMITS.path_max_samples_per_sec) return TIER_RESULT.MISS;
+      }
+
+      // 5) Reconstruct deterministic reference polyline.
+      const reference = getReferencePolyline(
+        params.patternIndex,
+        params.rotationDeg,
+        params.sizePx,
+        params.insetPx,
+      );
+
+      // 6) Score.
+      const result = scoreTrace(samples, reference, {
+        perfectDevPx: params.perfectDevPx,
+        goodDevPx:    params.goodDevPx,
+      });
+      // 7) Map tier to TIER_RESULT (drops `reason` deliberately - reason
+      //    is for client/test debugging via scoreTrace directly).
+      return TIER_RESULT[result.tier] || TIER_RESULT.MISS;
     }
     case MECHANIC_TYPES.NONE:
     default:
