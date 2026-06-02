@@ -75,6 +75,9 @@ export const TIMING = {
   rate_bucket_idle_ttl_ms:    envPosInt('MM_RATE_BUCKET_IDLE_TTL_MS',  600_000),
   rate_bucket_sweep_ms:       envPosInt('MM_RATE_BUCKET_SWEEP_MS',     60_000),
   period_choice_deadline_ms:  envInt('MM_PERIOD_CHOICE_DEADLINE_MS',  30_000),
+  // AFK card-pick deadline: auto-pick a MISS so an online round can't stall on a
+  // missing card_pick. Kept conservatively below the client's 25s watchdog.
+  card_pick_deadline_ms:      envInt('MM_CARD_PICK_DEADLINE_MS',      20_000),
   high_rtt_warning_threshold: envInt('MM_HIGH_RTT_WARN_MS',           350),
   // Per-mechanic deadlines (challenge timeout)
   charge_deadline_ms:   envInt('MM_CHARGE_DEADLINE_MS',   4500),

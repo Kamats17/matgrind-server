@@ -12,6 +12,7 @@ import { RoomManager } from './roomManager.mjs';
 import { resetMetrics, getCounter, getGauge } from './metrics.mjs';
 import { CARDS } from '../src/lib/wrestlingCards.js';
 import { getMechanicForCard, MECHANIC_TYPES } from '../src/lib/cardArchetypeMechanics.js';
+import { TIMING } from './config.mjs';
 
 let nextUid = 0;
 function fakeWs(name = 'p') {
@@ -837,4 +838,105 @@ test('Codex regression: challenge_input arriving without card_pick is silently d
   // No challenge exists; no challenge_resolved; no error broadcast either
   // (the server silently ignores - this is the intended behavior).
   assert.equal(host.sent.find(m => m.type === 'challenge_resolved'), undefined);
+});
+
+// ── Hotfix: server-side AFK card-pick deadline ──────────────────────────
+
+test('AFK auto-pick: _lowestStaminaCard returns lowest staminaCost, tie-broken by id', () => {
+  const { rm } = setupMatch();
+  const hand = [
+    { id: 'zeta', staminaCost: 5 },
+    { id: 'beta', staminaCost: 3 },
+    { id: 'alpha', staminaCost: 3 },
+    { id: 'gamma', staminaCost: 9 },
+  ];
+  assert.equal(rm._lowestStaminaCard(hand).id, 'alpha', 'lowest cost, tie resolved to first by id');
+  assert.equal(rm._lowestStaminaCard([]), null, 'empty hand -> null');
+});
+
+test('AFK card-pick deadline: roles that never pick are auto-picked (MISS) and the round resolves', () => {
+  const { rm, host } = setupMatch();
+  const room = rm.rooms.get(host._roomCode);
+  room.hands.p1 = [cardById('single_leg')];
+  room.hands.p2 = [cardById('single_leg')];
+  room.preGeneratedChallenges.p1 = rm._preGenerate(room.hands.p1, room.challengeRngP1);
+  room.preGeneratedChallenges.p2 = rm._preGenerate(room.hands.p2, room.challengeRngP2);
+  const startRound = room.roundSeq;
+
+  rm._onCardPickDeadline(room, room.roundSeq);
+
+  assert.notEqual(room.roundSeq, startRound, 'auto-picking both AFK roles resolves + advances the round');
+  assert.equal(getCounter('card_pick_timeout_total', { phase: 'playing' }), 2, 'both AFK roles auto-picked');
+});
+
+test('AFK card-pick deadline: does not overwrite a real pick (challenge in flight)', () => {
+  const { rm, host } = setupMatch();
+  const room = rm.rooms.get(host._roomCode);
+  room.hands.p1 = [cardById('single_leg')];
+  room.preGeneratedChallenges.p1 = rm._preGenerate(room.hands.p1, room.challengeRngP1);
+  rm.handleGameMessage(host, { type: 'card_pick', roundSeq: room.roundSeq, cardId: 'single_leg' });
+  assert.equal(room.pendingPicks.p1, 'single_leg', 'precondition: real pick recorded');
+  assert.equal(room.skillResults.p1, null, 'precondition: challenge in flight, not yet resolved');
+  const startRound = room.roundSeq;
+
+  rm._onCardPickDeadline(room, room.roundSeq);
+
+  assert.equal(room.pendingPicks.p1, 'single_leg', 'real pick is NOT overwritten');
+  assert.equal(room.skillResults.p1, null, 'real pick is NOT forced to MISS');
+  assert.equal(getCounter('card_pick_timeout_total', { phase: 'playing' }), 1, 'only the AFK p2 is auto-picked');
+  assert.equal(room.roundSeq, startRound, 'round does not resolve while p1 challenge is still pending');
+});
+
+test('AFK card-pick deadline: one picked + opponent disconnected resolves before the 25s client watchdog', () => {
+  const { rm, host, guest } = setupMatch();
+  const room = rm.rooms.get(host._roomCode);
+  // p1 already picked + resolved (simulate a completed pick).
+  room.pendingPicks.p1 = room.hands.p1[0].id;
+  room.skillResults.p1 = { tier: 'MISS', bonus: 0, narrowRng: false, rngRange: 3 };
+  // p2 drops without ever picking.
+  rm.handleDisconnect(guest);
+  const startRound = room.roundSeq;
+
+  rm._onCardPickDeadline(room, room.roundSeq);
+
+  assert.notEqual(room.roundSeq, startRound, 'auto-pick for the disconnected p2 resolves the round');
+  assert.equal(getCounter('card_pick_timeout_total', { phase: 'playing' }), 1);
+  assert.ok(TIMING.card_pick_deadline_ms < 25000, 'card-pick deadline fires before the 25s client watchdog');
+});
+
+test('AFK card-pick deadline: reconnect after an auto-pick receives the advanced state_update', () => {
+  const { rm, host, guest } = setupMatch();
+  const room = rm.rooms.get(host._roomCode);
+  room.pendingPicks.p1 = room.hands.p1[0].id;
+  room.skillResults.p1 = { tier: 'MISS', bonus: 0, narrowRng: false, rngRange: 3 };
+  rm.handleDisconnect(guest);
+  rm._onCardPickDeadline(room, room.roundSeq);
+  const advanced = room.roundSeq;
+
+  const newGuest = fakeWs('reconn-afk');
+  newGuest._uid = guest._uid;
+  rm.handleReconnect(newGuest, guest._uid);
+
+  const su = lastMsg(newGuest, 'state_update');
+  assert.ok(su, 'reconnect receives a state_update');
+  assert.equal(su.roundSeq, advanced, 'state_update carries the advanced round');
+});
+
+test('AFK card-pick deadline: the real scheduleTimer fires and resolves a stalled round', async () => {
+  const config = await import('./config.mjs');
+  const originalMs = config.TIMING.card_pick_deadline_ms;
+  config.TIMING.card_pick_deadline_ms = 30; // shrink for a fast deterministic test
+  let roomCode;
+  try {
+    const { rm, host } = setupMatch();   // _startMatch arms the deadline (phase playing)
+    const room = rm.rooms.get(host._roomCode);
+    roomCode = room.code;
+    const startRound = room.roundSeq;
+    assert.ok(room.cardPickDeadlineTimer, 'card-pick deadline armed at round open');
+    await new Promise(r => setTimeout(r, 90));
+    assert.notEqual(room.roundSeq, startRound, 'deadline fired -> AFK auto-pick -> round resolved');
+    rm.destroyRoom(roomCode); // stop the auto-resolve loop cleanly
+  } finally {
+    config.TIMING.card_pick_deadline_ms = originalMs;
+  }
 });

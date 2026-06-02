@@ -511,6 +511,7 @@ export class RoomManager {
       rttEstimators: new Map(),         // uid -> RttEstimator
       reconnectTimers: { p1: null, p2: null },
       periodChoiceDeadlineTimer: null,
+      cardPickDeadlineTimer: null,
       allTimers: new Set(),
       lastActivity: Date.now(),
       createdAt: Date.now(),
@@ -600,6 +601,11 @@ export class RoomManager {
     for (const s of room.spectators.values()) {
       this._sendStateUpdateTo(room, s.ws, 'spectator', s.uid);
     }
+    // Arm the AFK card-pick deadline only for card-pick rounds; cancel it for
+    // pin/period/finished phases (which use their own flows).
+    const phase = room.matchState?.phase;
+    if (phase === 'playing' || phase === 'overtime') this._startCardPickDeadline(room);
+    else this._cancelCardPickDeadline(room);
   }
 
   _sendStateUpdateTo(room, ws, role, _uid) {
@@ -735,6 +741,7 @@ export class RoomManager {
       return;
     }
     room.matchState = next;
+    this._cancelCardPickDeadline(room); // round resolved; re-armed by _broadcastStateUpdate if next is a card-pick round
     this._postResolveRound(room);
   }
 
@@ -929,6 +936,57 @@ export class RoomManager {
     }
   }
 
+  // ── AFK card-pick deadline ─────────────────────────────────────────────
+  // Authoritative server-side deadline so a card-pick round can't stall waiting
+  // for a missing card_pick (e.g. an opponent who disconnects/stalls before
+  // picking, which otherwise trips the waiting client's local watchdog).
+
+  _startCardPickDeadline(room) {
+    this._cancelCardPickDeadline(room);
+    const armedRoundSeq = room.roundSeq;
+    room.cardPickDeadlineTimer = scheduleTimer(room, () => {
+      this._onCardPickDeadline(room, armedRoundSeq);
+    }, TIMING.card_pick_deadline_ms);
+  }
+
+  _cancelCardPickDeadline(room) {
+    if (room.cardPickDeadlineTimer) {
+      clearScheduled(room, room.cardPickDeadlineTimer);
+      room.cardPickDeadlineTimer = null;
+    }
+  }
+
+  // Lowest-staminaCost card in a hand; ties broken deterministically by id.
+  _lowestStaminaCard(hand) {
+    if (!Array.isArray(hand) || hand.length === 0) return null;
+    return [...hand].sort((a, b) =>
+      ((a.staminaCost ?? Infinity) - (b.staminaCost ?? Infinity)) || a.id.localeCompare(b.id),
+    )[0];
+  }
+
+  // A role that never submitted card_pick by the deadline gets a legal low-cost
+  // card assigned as a forced MISS (no challenge), so the round resolves instead
+  // of stalling. Never overwrites a real pick; AFK is NOT gameplay intent, so
+  // acceptedIntent is left untouched. No client message — the resulting
+  // state_update advances all clients (old clients included).
+  _onCardPickDeadline(room, roundSeq) {
+    if (room.roundSeq !== roundSeq) return;                  // stale: round already advanced
+    const phase = room.matchState?.phase;
+    if (phase !== 'playing' && phase !== 'overtime') return; // not a card-pick phase
+    let autoPicked = false;
+    for (const role of ['p1', 'p2']) {
+      if (room.pendingPicks[role] !== null) continue;        // real pick stands; never overwrite
+      const card = this._lowestStaminaCard(room.hands[role]);
+      if (!card) continue;
+      room.pendingPicks[role] = card.id;
+      room.skillResults[role] = getMissResult();             // auto-pick is always MISS, no challenge
+      incCounter('card_pick_timeout_total', { phase });
+      logEvent('card_pick_timeout', { room: room.code, role, cardId: card.id, roundSeq });
+      autoPicked = true;
+    }
+    if (autoPicked) this._maybeResolveRound(room);
+  }
+
   // ── Reroll ───────────────────────────────────────────────────────────
 
   _handleRequestReroll(room, role, ws, msg) {
@@ -1055,6 +1113,7 @@ export class RoomManager {
     room.rematchVotes = { p1: null, p2: null };
     room.matchEndedAt = null;
     room.periodChoiceDeadlineTimer = null;
+    room.cardPickDeadlineTimer = null;
   }
 
   _handleConfig(room, role, ws, msg) {
