@@ -252,6 +252,35 @@ test('pin_pick: offense card from prior stage CAN be reused (matches engine)', (
   assert.ok(ack, 'offense reuse must be accepted');
 });
 
+test('pin deadline: a stalled pin auto-resolves instead of hanging forever', () => {
+  const { rm, host, guest } = setupMatch();
+  const room = rm.rooms.values().next().value;
+  // Force a real stage-1 pin attempt (p1 attacking p2). resolvePinStage1 reads
+  // pinAttempt.pinChance; the rest of matchState is the real initial state.
+  room.matchState.phase = 'pin_attempt';
+  room.matchState.pinAttempt = { attacker: 'p1', stage: 1, pinChance: 0.3 };
+  room.pendingPinPicks = { offense: null, defense: null };
+  room.pinBurned = { offense: new Set(), defense: new Set() };
+  host.sent.length = 0;
+  guest.sent.length = 0;
+
+  // Deadline fires with NEITHER side having submitted a pin_pick.
+  rm._onPinPickDeadline(room, room.roundSeq);
+
+  // Must NOT hang: a state_update is broadcast and pending picks are consumed.
+  const stateUpdate = lastMsg(host, 'state_update');
+  assert.ok(stateUpdate, 'a state_update must be broadcast after the pin deadline');
+  assert.deepEqual(room.pendingPinPicks, { offense: null, defense: null },
+    'pendingPinPicks reset after auto-resolve');
+  // The pin advanced: a later pin stage, OR a terminal / non-pin phase.
+  const phase = room.matchState.phase;
+  const stage = room.matchState.pinAttempt?.stage ?? null;
+  assert.ok(phase !== 'pin_attempt' || stage !== 1,
+    `pin must advance off stage 1 (phase=${phase}, stage=${stage})`);
+  assert.equal(getCounter('pin_pick_timeout_total', { stage: '1' }), 1,
+    'a pin_pick_timeout metric is recorded');
+});
+
 // ── Period choice ───────────────────────────────────────────────────────
 
 test('period_choice: only the chooser can submit', () => {
@@ -303,6 +332,42 @@ test('reconnect: fresh ws receives reconnected + state_update replay', () => {
   assert.equal(ok, true);
   assert.ok(findMsg(newGuest, 'reconnected'));
   assert.ok(findMsg(newGuest, 'state_update'));
+});
+
+test('reconnect: the reconnected message carries the role so a cold lobby can rejoin', () => {
+  const { rm, guest } = setupMatch();
+  rm.handleDisconnect(guest);
+  const newGuest = fakeWs('reconn-role');
+  newGuest._uid = guest._uid;
+  rm.handleReconnect(newGuest, guest._uid);
+  const reconn = findMsg(newGuest, 'reconnected');
+  assert.ok(reconn, 'reconnected sent');
+  assert.equal(reconn.role, 'p2', 'guest reconnects as p2 (role needed to hand off to the game)');
+});
+
+test('reconnect: a FINISHED room frees the player instead of trapping them as active', () => {
+  const { rm, guest } = setupMatch();
+  const room = rm.rooms.values().next().value;
+  // Match finished while this player was offline (e.g. a forfeit settled).
+  room.matchState = { ...room.matchState, phase: 'finished', winner: 'p1', winMethod: 'forfeit' };
+  rm._setRoomPhase(room, 'finished');
+  rm.handleDisconnect(guest);
+
+  // inspectSession must classify a finished room as terminal, not active —
+  // otherwise the controller suppresses auth_success and the lobby hangs.
+  const plan = rm.inspectSession(guest._uid);
+  assert.equal(plan.status, 'terminal', 'finished room is terminal');
+  assert.equal(plan.reason, 'match_already_finished');
+
+  const newGuest = fakeWs('reconn-finished');
+  newGuest._uid = guest._uid;
+  const ok = rm.handleReconnect(newGuest, guest._uid);
+  assert.equal(ok, false, 'not re-adopted into a dead room');
+  const voided = findMsg(newGuest, 'match_voided');
+  assert.ok(voided, 'player is freed with a terminal notice');
+  assert.equal(voided.reason, 'match_already_finished');
+  assert.equal(findMsg(newGuest, 'reconnected'), undefined, 'no fake reconnected/waiting trap');
+  assert.equal(rm.playerRooms.has(guest._uid), false, 'per-user mapping cleared so they can queue again');
 });
 
 // ── Match end + rematch ────────────────────────────────────────────────

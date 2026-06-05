@@ -78,6 +78,12 @@ export const TIMING = {
   // AFK card-pick deadline: auto-pick a MISS so an online round can't stall on a
   // missing card_pick. Kept conservatively below the client's 25s watchdog.
   card_pick_deadline_ms:      envInt('MM_CARD_PICK_DEADLINE_MS',      20_000),
+  // AFK pin-pick deadline: a pin stage waits for BOTH offense and defense
+  // pin_picks, so a stalled/backgrounded/mis-firing pinner would freeze the
+  // match forever (the card-pick deadline only arms for playing/overtime). On
+  // timeout the server auto-submits a default pick for the missing side(s) and
+  // resolves the stage. Same conservative 20s.
+  pin_pick_deadline_ms:       envInt('MM_PIN_PICK_DEADLINE_MS',       20_000),
   high_rtt_warning_threshold: envInt('MM_HIGH_RTT_WARN_MS',           350),
   // Per-mechanic deadlines (challenge timeout)
   charge_deadline_ms:   envInt('MM_CHARGE_DEADLINE_MS',   4500),

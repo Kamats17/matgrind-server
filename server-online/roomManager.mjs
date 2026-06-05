@@ -512,6 +512,7 @@ export class RoomManager {
       reconnectTimers: { p1: null, p2: null },
       periodChoiceDeadlineTimer: null,
       cardPickDeadlineTimer: null,
+      pinPickDeadlineTimer: null,
       allTimers: new Set(),
       lastActivity: Date.now(),
       createdAt: Date.now(),
@@ -602,10 +603,15 @@ export class RoomManager {
       this._sendStateUpdateTo(room, s.ws, 'spectator', s.uid);
     }
     // Arm the AFK card-pick deadline only for card-pick rounds; cancel it for
-    // pin/period/finished phases (which use their own flows).
+    // pin/period/finished phases (which use their own flows). Arm the pin-pick
+    // deadline for pin stages. Both are armed HERE (after the roundSeq++ above)
+    // so the timer captures the post-increment roundSeq and is never instantly
+    // stale - do not arm from _postResolveRound/_postResolvePin (pre-increment).
     const phase = room.matchState?.phase;
     if (phase === 'playing' || phase === 'overtime') this._startCardPickDeadline(room);
     else this._cancelCardPickDeadline(room);
+    if (phase === 'pin_attempt') this._startPinPickDeadline(room);
+    else this._cancelPinPickDeadline(room);
   }
 
   _sendStateUpdateTo(room, ws, role, _uid) {
@@ -987,6 +993,103 @@ export class RoomManager {
     if (autoPicked) this._maybeResolveRound(room);
   }
 
+  // ── AFK pin-pick deadline ──────────────────────────────────────────────
+  // A pin stage resolves only when BOTH offense and defense pin_picks arrive
+  // (_handlePinPick). Without a deadline a pinner who stalls/backgrounds/
+  // mis-fires the gesture freezes the match forever - the card-pick deadline
+  // only arms for playing/overtime. Mirror it: on timeout, auto-submit a
+  // deterministic default for whichever side hasn't picked, then resolve the
+  // stage so the match can never hang on a pin.
+
+  _startPinPickDeadline(room) {
+    this._cancelPinPickDeadline(room);
+    const armedRoundSeq = room.roundSeq;
+    room.pinPickDeadlineTimer = scheduleTimer(room, () => {
+      this._onPinPickDeadline(room, armedRoundSeq);
+    }, TIMING.pin_pick_deadline_ms);
+  }
+
+  _cancelPinPickDeadline(room) {
+    if (room.pinPickDeadlineTimer) {
+      clearScheduled(room, room.pinPickDeadlineTimer);
+      room.pinPickDeadlineTimer = null;
+    }
+  }
+
+  // Weakest (lowest-resistance) pin DEFENSE card not already burned this pin
+  // sequence; deterministic tie-break by id. Mirrors _lowestStaminaCard for the
+  // defense pool. 4 defense cards vs <=3 stages means one is always free.
+  _lowestResistanceDefenseCard(burned) {
+    return Object.values(PIN_DEFENSE_CARDS)
+      .filter(c => !burned.has(c.id))
+      .sort((a, b) =>
+        ((a.resistance ?? Infinity) - (b.resistance ?? Infinity)) || a.id.localeCompare(b.id),
+      )[0] || null;
+  }
+
+  // A pin side that never submitted pin_pick by the deadline gets a default
+  // assigned so the stage resolves instead of stalling. Offense default keeps
+  // the lock (pin_lock_position - legal at every stage, weak so an AFK attacker
+  // can't auto-win); defense default is the weakest non-burned escape (an AFK
+  // defender is penalised, consistent with card-pick AFK = MISS). Never
+  // overwrites a real pick; AFK is not gameplay intent, so acceptedIntent is
+  // left untouched. No client message - the resulting state_update advances all
+  // clients (mirrors _onCardPickDeadline).
+  _onPinPickDeadline(room, roundSeq) {
+    if (room.roundSeq !== roundSeq) return;                  // stale: round already advanced
+    if (room.matchState?.phase !== 'pin_attempt') return;    // not a pin stage anymore
+    const attacker = room.matchState.pinAttempt?.attacker;
+    if (!attacker) return;
+
+    let autoPicked = false;
+    if (room.pendingPinPicks.offense === null) {
+      room.pendingPinPicks.offense = 'pin_lock_position';
+      autoPicked = true;
+    }
+    if (room.pendingPinPicks.defense === null) {
+      const def = this._lowestResistanceDefenseCard(room.pinBurned.defense);
+      if (def) {
+        room.pinBurned.defense.add(def.id);
+        room.pendingPinPicks.defense = def.id;
+        autoPicked = true;
+      }
+    }
+    if (!autoPicked) return;
+    const stage = room.matchState.pinAttempt?.stage ?? 1;
+    incCounter('pin_pick_timeout_total', { stage: String(stage) });
+    logEvent('pin_pick_timeout', {
+      room: room.code,
+      offense: room.pendingPinPicks.offense,
+      defense: room.pendingPinPicks.defense,
+      stage, roundSeq,
+    });
+
+    // Both sides now have a pick - resolve the stage exactly as _handlePinPick.
+    if (room.pendingPinPicks.offense && room.pendingPinPicks.defense) {
+      const off = room.pendingPinPicks.offense;
+      const def = room.pendingPinPicks.defense;
+      let next;
+      try {
+        const resolver = stage === 1 ? resolvePinStage1
+          : stage === 2 ? resolvePinStage2
+          : resolvePinStage3;
+        next = resolver(room.matchState, off, def, room.engineRng);
+      } catch (err) {
+        this._engineThrow(room, err, { off, def, stage });
+        return;
+      }
+      logEvent('pin_resolved', {
+        room: room.code, stage, off, def,
+        nextPhase: next?.phase,
+        nextStage: next?.pinAttempt?.stage ?? null,
+        winner: next?.winner ?? null,
+        viaTimeout: true,
+      });
+      room.matchState = next;
+      this._postResolvePin(room);
+    }
+  }
+
   // ── Reroll ───────────────────────────────────────────────────────────
 
   _handleRequestReroll(room, role, ws, msg) {
@@ -1295,14 +1398,62 @@ export class RoomManager {
     );
   }
 
-  // Fired when a disconnected player's reconnect grace elapses. Voids the
-  // room (no loss is assigned — our own infra may be the cause) and labels
-  // the void by whether the dropper had engaged with the match yet.
+  // Fired when a disconnected player's reconnect grace elapses. A STARTED match
+  // that stays abandoned past the grace is a FORFEIT (the connected opponent
+  // wins) so a player can't dodge a loss by refreshing/closing the tab. A
+  // never-engaged no-show — or a drop outside live play — still voids with no
+  // result (our own infra may be the cause, and there's no started match to
+  // award). The 45s grace + 90s reconnect window already shield genuine blips,
+  // so only a player who is gone past the window is forfeited.
   _onReconnectGraceExpired(room, role) {
     const member = role === 'p1' ? room.host : room.guest;
     if (member?.ws) return; // reconnected within grace — nothing to do
+    // Match already ended (the OTHER side's grace timer resolved it, or a late
+    // drop after a normal finish): a stale grace timer must not void/clobber a
+    // terminal room. Without this, a double disconnect would fire two timers and
+    // the second would void a room the first already settled.
+    if (room.phase === 'finished' || room.phase === 'voided') return;
     incCounter('reconnect_timeout_total', { phase: room.phase });
+    const engaged = room.matchAccepted?.[role] || room.acceptedIntent?.[role];
+    // Forfeit ONLY when there is a CONNECTED opponent to award the win to. If
+    // both players are gone (double disconnect / both refreshed), nobody earns a
+    // win — void instead. Otherwise the first-expiring grace timer would hand the
+    // win to a player who has also abandoned the match.
+    const opponent = role === 'p1' ? room.guest : room.host;
+    const opponentConnected = !!opponent?.ws;
+    if (engaged && opponentConnected && room.phase === 'playing'
+        && room.matchState && room.matchState.phase !== 'finished') {
+      this._forfeitMatch(room, role);
+      return;
+    }
     this._voidRoom(room, this._disconnectVoidReason(room, role));
+  }
+
+  // Forfeit a started match abandoned by `abandoner`. The opponent wins. Mirrors
+  // the normal finish path: mark the engine state finished with winMethod
+  // 'forfeit', sync the room phase, broadcast a TERMINAL state_update (so the
+  // connected opponent's client transitions to the result screen), then emit the
+  // authoritative result so both online_progress docs are written (winner +win,
+  // abandoner +loss). The abandoner reconciles via the Firestore fallback or a
+  // later reconnect replaying the finished state.
+  _forfeitMatch(room, abandoner) {
+    const winner = abandoner === 'p1' ? 'p2' : 'p1';
+    this._cancelCardPickDeadline(room);
+    this._cancelPeriodChoiceDeadline(room);
+    this._cancelPinPickDeadline(room);
+    if (room.matchState) {
+      room.matchState = { ...room.matchState, phase: 'finished', winner, winMethod: 'forfeit' };
+    }
+    this._setRoomPhase(room, 'finished');
+    room.matchEndedAt = Date.now();
+    incCounter('matches_forfeited_total', { abandoner });
+    logEvent('match_forfeit', {
+      room: room.code, abandoner, winner,
+      roundSeq: room.roundSeq,
+      matchPhase: room.matchState?.phase || null,
+    });
+    this._broadcastStateUpdate(room);   // terminal state_update -> opponent sees result
+    this._emitMatchResult(room);        // authoritative win/loss -> online_progress
   }
 
   // Honest disconnect classification (Stage 3). A role counts as ENGAGED if it
@@ -1337,12 +1488,17 @@ export class RoomManager {
       const room = this.rooms.get(code);
       if (room) {
         if (room.phase === 'voided') return { status: 'terminal', roomCode: code, reason: 'room_already_voided' };
+        // A finished match (e.g. a forfeit settled while this player was offline)
+        // is ALSO terminal - never report it as active, or a cold reconnect would
+        // be adopted into a dead room and the lobby would hang in "waiting".
+        if (room.phase === 'finished') return { status: 'terminal', roomCode: code, reason: 'match_already_finished' };
         return { status: 'active', roomCode: code, kind: 'player' };
       }
     }
     for (const room of this.rooms.values()) {
       if (room.spectators.has(uid)) {
         if (room.phase === 'voided') return { status: 'terminal', roomCode: room.code, reason: 'room_already_voided' };
+        if (room.phase === 'finished') return { status: 'terminal', roomCode: room.code, reason: 'match_already_finished' };
         return { status: 'active', roomCode: room.code, kind: 'spectator' };
       }
     }
@@ -1359,11 +1515,12 @@ export class RoomManager {
       // Maybe a spectator
       for (const room of this.rooms.values()) {
         if (room.spectators.has(uid)) {
-          if (room.phase === 'voided') {
-            // Terminal spectator: the match was voided and the room is retained
-            // only for this notice. Tell them, drop the mapping, and do NOT
-            // adopt the socket or replay state.
-            send(ws, { type: 'match_voided', reason: 'room_already_voided' });
+          if (room.phase === 'voided' || room.phase === 'finished') {
+            // Terminal spectator: the match was voided or has already finished and
+            // the room is retained only for this notice. Tell them, drop the
+            // mapping, and do NOT adopt the socket or replay state.
+            const reason = room.phase === 'voided' ? 'room_already_voided' : 'match_already_finished';
+            send(ws, { type: 'match_voided', reason });
             room.spectators.delete(uid);
             return false;
           }
@@ -1379,15 +1536,17 @@ export class RoomManager {
     }
     const room = this.rooms.get(code);
     if (!room) return false;
-    // Voided-room bail: the offline player just got online; their match
-    // was already voided (engine throw or grace-timeout). Send the
-    // terminal notification so the client's reconnect loop stops
-    // (NetworkClient._stopReconnecting() is gated on match_voided /
-    // room_expired) and clear the per-user mapping. The room itself
-    // stays in this.rooms until cleanupIdleRooms reaps it - any further
-    // game messages still hit the room.phase === 'voided' rejection.
-    if (room.phase === 'voided') {
-      send(ws, { type: 'match_voided', reason: 'room_already_voided' });
+    // Terminal-room bail: the offline player just got online but their match is
+    // already over - voided (engine throw / grace-timeout) OR finished (e.g. a
+    // forfeit settled while they were away). Send the terminal notice so the
+    // client's reconnect loop stops (NetworkClient._stopReconnecting() is gated
+    // on match_voided / room_expired) and the lobby frees the player instead of
+    // hanging in "waiting", then clear the per-user mapping. The room stays in
+    // this.rooms until cleanupIdleRooms reaps it; the result of a finished match
+    // is already in Firestore (online_progress), so the client reconciles there.
+    if (room.phase === 'voided' || room.phase === 'finished') {
+      const reason = room.phase === 'voided' ? 'room_already_voided' : 'match_already_finished';
+      send(ws, { type: 'match_voided', reason });
       this.playerRooms.delete(uid);
       return false;
     }
@@ -1401,7 +1560,10 @@ export class RoomManager {
       clearScheduled(room, room.reconnectTimers[role]);
       room.reconnectTimers[role] = null;
     }
-    send(ws, { type: 'reconnected', roomCode: code });
+    // Include `role` so a cold-reconnecting lobby (no game_start in this session)
+    // knows which side it is and can hand off to the game via the state_update
+    // that follows.
+    send(ws, { type: 'reconnected', roomCode: code, role });
     if (room.matchState) this._sendStateUpdateTo(room, ws, role, uid);
     // Replay any active challenge so the client re-renders mini-game UI.
     const ch = room.challenges[role];

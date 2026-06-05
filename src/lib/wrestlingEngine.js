@@ -133,6 +133,11 @@ function createWrestler(name, id, stats = null, opts = {}) {
     score: 0,
     stats: s,
     stamina: (200 + (s.end - 50) * 0.2) * staminaMul, // END 50->200, END 80->206, END 100->210
+    // Per-wrestler stamina pool ceiling. END (and career stamina buffs) raise the
+    // pool above 200, so the HUD must divide by THIS, not a hardcoded 200, or a
+    // fresh END>50 wrestler reads "202/200". Stamina only ever decreases, so this
+    // is the bar's denominator for the whole match.
+    maxStamina: (200 + (s.end - 50) * 0.2) * staminaMul,
     position: POSITIONS.NEUTRAL,
     takedownCount: 0,
     escapeCount: 0,
@@ -531,25 +536,22 @@ function findRerollViolators(hand, prevIds) {
 
 // ─── Phase 3 - Referee Calls (stalling) ────────────────────────────────────
 //
-// Folkstyle rule (matches real NCAA / NFHS scoring): the FIRST stalling
-// call is a free warning; every subsequent stalling call awards
-// STALLING_PENALTY (1 pt in folkstyle) to the opponent. The counter
-// keeps accumulating - it does NOT reset after a penalty - so an
-// offender who keeps ducking the action keeps bleeding points to the
-// other guy.
+// Stalling ladder (MatGrind, user spec 2026-06): the first THREE stalling
+// calls are free warnings; calls 4 and 5 each award STALLING_PENALTY (1 pt
+// in folkstyle) to the opponent; the SIXTH call is a DISQUALIFICATION (the
+// opponent wins, match over). The counter keeps accumulating - it does NOT
+// reset - so a wrestler who keeps ducking the action escalates to a DQ
+// instead of bleeding points forever (the old rule capped at endless +1s).
 //
 // Trigger: player P picks a `neutral_counter` card from the neutral
 // position while the opponent holds initiative AND the neutral has
-// already stalled (`neutralStaleCount >= 2`). Increment P's personal
-// stallCount.
+// already stalled (`neutralStaleCount >= 2`); the path-mechanic
+// transition-spam ladder also calls this on repeated transitions.
 //
-// stallCount[player] state machine:
-//   1   -> free warning (announcement only)
-//   2+  -> +1 STALLING_PENALTY to opponent (every subsequent stall)
-//
-// This replaces the previous "1 & 2 free, 3 = penalty + reset" rule
-// per user feedback - the old rule rarely landed because the offender
-// would mix in one active turn between stalls and the count reset.
+// stallCount[player] state machine (STALL_WARN_THROUGH=3, STALL_DQ_AT=6):
+//   1..3  -> free warning (announcement only)
+//   4..5  -> +1 STALLING_PENALTY to opponent
+//   6     -> DISQUALIFICATION (winner = opponent, winMethod = 'dq')
 //
 // The existing `neutralStaleCount`-based system in resolveRound handles
 // mutual inactivity (both wrestlers stalling). This per-player layer
@@ -569,23 +571,45 @@ export function checkStalling(s, player, card, opponent) {
   applyStallingCall(s, player, opponent, 'passive_neutral_counter');
 }
 
-// Shared warning/penalty body used by both checkStalling and the
-// path-mechanic transition-spam ladder. First call = warning only;
-// count >= 2 = opponent awarded STALLING_PENALTY (= 1 in folkstyle).
-// Counter does NOT reset - persistent offences keep awarding points.
+// Stalling escalation thresholds (folkstyle). Per offender; the counter never
+// resets. Calls 1..STALL_WARN_THROUGH are warnings; calls above that up to (but
+// not including) STALL_DQ_AT award +1 each; the STALL_DQ_AT-th call is a DQ.
+export const STALL_WARN_THROUGH = 3;
+export const STALL_DQ_AT = 6;
+
+// Shared body used by both checkStalling and the path-mechanic transition-spam
+// ladder. Applies the warning -> penalty -> DQ ladder above. Counter does NOT
+// reset, so persistent stalling escalates all the way to a disqualification.
 export function applyStallingCall(s, offender, beneficiary, reason) {
   if (!s.stallCount) s.stallCount = { p1: 0, p2: 0 };
   s.stallCount[offender] = (s.stallCount[offender] || 0) + 1;
   const count = s.stallCount[offender];
   const offName = s[offender]?.name || offender.toUpperCase();
   const benName = s[beneficiary]?.name || beneficiary.toUpperCase();
+  const prior = s.lastResult?.message ? s.lastResult.message + ' · ' : '';
 
-  if (count >= 2) {
+  if (count >= STALL_DQ_AT) {
+    // Terminal: disqualification. The opponent wins and the match ends. No
+    // extra point is added - the DQ itself is the consequence.
+    s.winner = beneficiary;
+    s.winMethod = 'dq';
+    s.phase = 'finished';
+    const entry = `⚠ STALLING DISQUALIFICATION (call ${count}, ${reason}) - ${offName} DQ'd · ${benName} wins`;
+    s.log = [...(s.log || []), { round: s.roundNumber, entry, type: 'stalling_dq' }];
+    s.lastResult = {
+      ...(s.lastResult || {}),
+      type: 'stalling_dq',
+      stallingOffender: offender,
+      stallingBeneficiary: beneficiary,
+      stallingCallCount: count,
+      stallingReason: reason,
+      message: prior + `Stalling DQ! ${offName} disqualified - ${benName} wins.`,
+    };
+  } else if (count > STALL_WARN_THROUGH) {
     const pts = getScores(s.wrestlingStyle).STALLING_PENALTY || 1;
     s[beneficiary] = { ...s[beneficiary], score: s[beneficiary].score + pts };
     const entry = `⚠ Stalling penalty (call ${count}, ${reason}) - ${offName} · +${pts} ${benName}`;
     s.log = [...(s.log || []), { round: s.roundNumber, entry, type: 'stalling_penalty' }];
-    const prior = s.lastResult?.message ? s.lastResult.message + ' · ' : '';
     s.lastResult = {
       ...(s.lastResult || {}),
       type: 'stalling_penalty',
@@ -596,16 +620,19 @@ export function applyStallingCall(s, offender, beneficiary, reason) {
       message: prior + `Stalling! ${offName} penalised (+${pts} ${benName})`,
     };
   } else {
-    const entry = `⚠ Stalling warning (${reason}) - ${offName} · next stall awards a point`;
+    const remaining = STALL_WARN_THROUGH - count;
+    const tail = remaining > 0
+      ? `${remaining} more warning${remaining === 1 ? '' : 's'} before a point`
+      : 'next stall awards a point';
+    const entry = `⚠ Stalling warning (call ${count}, ${reason}) - ${offName} · ${tail}`;
     s.log = [...(s.log || []), { round: s.roundNumber, entry, type: 'stalling_warning' }];
-    const prior = s.lastResult?.message ? s.lastResult.message + ' · ' : '';
     s.lastResult = {
       ...(s.lastResult || {}),
       type: s.lastResult?.type || 'stalling_warning',
       stallingOffender: offender,
       stallingWarningCount: count,
       stallingReason: reason,
-      message: prior + `Stalling warning: ${offName} - next stall is +1 to opponent`,
+      message: prior + `Stalling warning: ${offName}`,
     };
   }
 }
@@ -725,7 +752,7 @@ export function resolveRound(state, p1CardId, p2CardId, p1Skill = null, p2Skill 
   const evalSpam = (side, oppSide) => {
     const n = s.consecutiveTransitions[side];
     const spam = transitionSpamFactor(n);
-    /** @type {{ level?: string, count: number, stall?: 'warning'|'penalty' } | null} */
+    /** @type {{ level?: string, count: number, stall?: 'warning'|'penalty'|'dq' } | null} */
     let meta = spam.level ? { level: spam.level, count: spam.count } : null;
     if (n >= MECHANIC_TUNING.path.spamStallAt && s.wrestlingStyle === 'folkstyle') {
       applyStallingCall(s, side, oppSide, 'transition_spam');
@@ -733,7 +760,8 @@ export function resolveRound(state, p1CardId, p2CardId, p1Skill = null, p2Skill 
       // s.lastResult, but the gameplay-result assignment below clobbers it - the
       // meta is the only channel that survives (tagSkill re-stamps it on every
       // exit path). stallCount[side] >= 2 means the opponent was just awarded +1.
-      meta = { ...(meta || { count: n }), stall: s.stallCount[side] >= 2 ? 'penalty' : 'warning' };
+      const sc = s.stallCount[side];
+      meta = { ...(meta || { count: n }), stall: sc >= STALL_DQ_AT ? 'dq' : sc > STALL_WARN_THROUGH ? 'penalty' : 'warning' };
     }
     if (meta) transitionSpamMeta[side] = meta;
     return spam.factor;

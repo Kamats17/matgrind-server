@@ -42,18 +42,22 @@ test('disconnect-timeout void: a never-accepted dropper is a no_show', () => {
     'never accepted + never played = no_show');
 });
 
-test('disconnect-timeout void: an accepted (match_accept) dropper is started_match', () => {
+test('disconnect-timeout: an accepted (match_accept) dropper forfeits a started match', () => {
   resetMetrics();
   const { rm, code, host } = setupRoom();
   const room = rm.rooms.get(code);
   rm.handleGameMessage(host, { type: 'match_accept' }); // accepted, no gameplay yet
   rm.handleDisconnect(host);
   rm._onReconnectGraceExpired(room, 'p1');
-  assert.equal(getCounter('matches_voided_total', { reason: 'started_match_disconnect', phase: 'playing' }), 1,
+  // Accepting the match counts as engaged: abandoning a started match forfeits
+  // (opponent wins) rather than voiding.
+  assert.equal(getCounter('matches_forfeited_total', { abandoner: 'p1' }), 1,
     'accepting the match counts as engaged even before any gameplay frame');
+  assert.equal(room.matchState.winner, 'p2');
+  assert.equal(room.matchState.winMethod, 'forfeit');
 });
 
-test('disconnect-timeout void: a player who produced gameplay intent is started_match', () => {
+test('disconnect-timeout: a player who produced gameplay intent forfeits', () => {
   resetMetrics();
   const { rm, code, host } = setupRoom();
   const room = rm.rooms.get(code);
@@ -61,7 +65,9 @@ test('disconnect-timeout void: a player who produced gameplay intent is started_
   rm.handleGameMessage(host, { type: 'card_pick', roundSeq: room.roundSeq, cardId: card.id });
   rm.handleDisconnect(host);
   rm._onReconnectGraceExpired(room, 'p1');
-  assert.equal(getCounter('matches_voided_total', { reason: 'started_match_disconnect', phase: 'playing' }), 1);
+  assert.equal(getCounter('matches_forfeited_total', { abandoner: 'p1' }), 1);
+  assert.equal(room.matchState.winner, 'p2');
+  assert.equal(room.matchState.winMethod, 'forfeit');
 });
 
 test('rematch reset clears matchAccepted', () => {

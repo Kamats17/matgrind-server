@@ -221,17 +221,22 @@ test('disconnect-timeout void is labeled no_show when the dropper never engaged'
   );
 });
 
-test('disconnect-timeout void is labeled started_match when the dropper had acted', () => {
+test('disconnect-timeout on a started match forfeits the dropper (opponent wins)', () => {
   resetMetrics();
   const { rm, code, host } = setupRoom();
   const room = rm.rooms.get(code);
-  room.acceptedIntent.p1 = true;
+  room.acceptedIntent.p1 = true; // engaged in a live match
   rm.handleDisconnect(host);
   rm._onReconnectGraceExpired(room, 'p1');
+  // New policy (2026-06): a started match abandoned past the grace is a FORFEIT
+  // (opponent wins), not a silent void - refreshing no longer dodges the loss.
   assert.equal(
-    getCounter('matches_voided_total', { reason: 'started_match_disconnect', phase: 'playing' }), 1,
-    'mid-match drop is started_match',
+    getCounter('matches_forfeited_total', { abandoner: 'p1' }), 1,
+    'mid-match abandonment forfeits',
   );
+  assert.equal(room.matchState.winner, 'p2');
+  assert.equal(room.matchState.winMethod, 'forfeit');
+  assert.equal(room.phase, 'finished');
 });
 
 // ── 1.5 Reconnect-outcome counters ─────────────────────────────────────────

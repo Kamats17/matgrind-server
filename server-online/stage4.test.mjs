@@ -112,3 +112,87 @@ test('a disconnected player is NOT pushed match_settled (relies on the Firestore
   assert.ok(host.sent.find((m) => m.type === 'match_settled'), 'connected host is pushed');
   assert.equal(guest.sent.find((m) => m.type === 'match_settled'), undefined, 'disconnected guest is not pushed');
 });
+
+// ── Started-match abandonment forfeits (not a silent void) ──────────────────
+
+test('grace-expiry on an ENGAGED match forfeits: opponent wins, result emitted', async () => {
+  const built = [];
+  const { rm, room, host, guest } = setup((b) => {
+    built.push(b);
+    return { receipts: [
+      { uid: host._uid, matchId: b.matchId, onlineProgress: { wins: 1 }, xpEarned: 100, achievementIds: [] },
+      { uid: guest._uid, matchId: b.matchId, onlineProgress: { losses: 1 }, xpEarned: 25, achievementIds: [] },
+    ] };
+  });
+  // Both engaged in a live match; guest then drops and never reconnects.
+  room.phase = 'playing';
+  room.acceptedIntent = { p1: true, p2: true };
+  room.guest.ws = null;
+  host.sent.length = 0;
+
+  rm._onReconnectGraceExpired(room, 'p2'); // guest's grace elapses
+  await Promise.resolve(); await Promise.resolve(); // let the settlement promise resolve
+
+  // Authoritative result: the connected opponent (p1/host) wins by forfeit.
+  assert.equal(built.length, 1, 'a result record is emitted (not a silent void)');
+  assert.equal(built[0].record.winner, 'p1');
+  assert.equal(built[0].record.winMethod, 'forfeit');
+  assert.equal(room.matchState.phase, 'finished');
+  assert.equal(room.matchState.winner, 'p1');
+  assert.equal(room.matchState.winMethod, 'forfeit');
+  assert.equal(room.phase, 'finished');
+  // The connected opponent gets a TERMINAL state_update + their settlement;
+  // never a void.
+  const term = host.sent.filter((m) => m.type === 'state_update').pop();
+  assert.ok(term, 'a terminal state_update is broadcast to the connected opponent');
+  assert.equal(term.state.phase, 'finished');
+  assert.ok(host.sent.find((m) => m.type === 'match_settled'), 'opponent receives match_settled');
+  assert.equal(host.sent.find((m) => m.type === 'match_voided'), undefined, 'no void on a forfeit');
+});
+
+test('grace-expiry on a NEVER-ENGAGED no-show still voids (no unearned win)', () => {
+  const built = [];
+  const { rm, room, host } = setup((b) => { built.push(b); });
+  room.phase = 'playing';
+  room.acceptedIntent = { p1: false, p2: false };
+  room.matchAccepted = { p1: false, p2: false };
+  room.guest.ws = null;
+  host.sent.length = 0;
+
+  rm._onReconnectGraceExpired(room, 'p2');
+
+  assert.equal(built.length, 0, 'no result emitted for a no-show');
+  assert.equal(room.phase, 'voided');
+  assert.ok(host.sent.find((m) => m.type === 'match_voided'), 'opponent gets a void notice');
+});
+
+test('grace-expiry with BOTH players disconnected voids (no forfeit win to an absent opponent)', () => {
+  const built = [];
+  const { rm, room } = setup((b) => { built.push(b); });
+  room.phase = 'playing';
+  room.acceptedIntent = { p1: true, p2: true }; // both engaged, then both dropped
+  room.host.ws = null;
+  room.guest.ws = null;
+
+  rm._onReconnectGraceExpired(room, 'p1'); // first grace timer to fire
+
+  assert.equal(built.length, 0, 'no result emitted when both players abandoned');
+  assert.equal(room.matchState.winner ?? null, null, 'no winner awarded to an absent opponent');
+  assert.notEqual(room.matchState.winMethod, 'forfeit');
+  assert.equal(room.phase, 'voided');
+});
+
+test('grace-expiry is a no-op once the match is already terminal (stale second timer)', () => {
+  const built = [];
+  const { rm, room } = setup((b) => { built.push(b); });
+  // Simulate the match already finished (e.g. the first side resolved it).
+  room.matchState = { ...room.matchState, phase: 'finished', winner: 'p1', winMethod: 'forfeit' };
+  rm._setRoomPhase(room, 'finished');
+  room.guest.ws = null;
+
+  rm._onReconnectGraceExpired(room, 'p2'); // a stale grace timer fires late
+
+  assert.equal(built.length, 0, 'no second result');
+  assert.equal(room.phase, 'finished', 'a finished room is not voided by a stale timer');
+  assert.equal(room.matchState.winner, 'p1', 'the original result is untouched');
+});
